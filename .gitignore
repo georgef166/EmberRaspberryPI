@@ -1,0 +1,12 @@
+.codex/
+example_cpp_extracted/
+
+Arducam_tof_camera/.git/
+Arducam_tof_camera/.git_backup/
+Arducam_tof_camera/build/
+Arducam_tof_camera/venv/
+Arducam_tof_camera/example/python/venv/
+Arducam_tof_camera/models/tensorflow_coco_ssd/ssd_mobilenet_v1_coco_2017_11_17/
+Arducam_tof_camera/models/tensorflow_coco_ssd/ssd_mobilenet_v1_coco_2017_11_17.tar.gz
+Arducam_tof_camera/models/tensorflow_coco_ssd/tf_text_graph_*.py
+Arducam_tof_camera/models/tensorflow_coco_ssd/__pycache__/
