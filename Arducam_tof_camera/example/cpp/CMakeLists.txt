@@ -13,7 +13,13 @@ target_link_libraries(capture_raw ${CXXLIBS} ${OpenCV_LIBS})
 add_executable(preview_usb preview_by_usb.cpp)
 target_link_libraries(preview_usb ${CXXLIBS} ${OpenCV_LIBS})
 
-add_executable(tactical_rescue tactical_rescue.cpp)
+add_executable(
+    tactical_rescue
+    tactical_rescue.cpp
+    tactical_rescue_capture.cpp
+    tactical_rescue_perception.cpp
+    tactical_rescue_render.cpp
+)
 target_link_libraries(tactical_rescue ${CXXLIBS} ${OpenCV_LIBS})
 
 aux_source_directory(example DIR_SRCS)
