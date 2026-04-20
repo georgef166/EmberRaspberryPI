@@ -351,17 +351,13 @@ cv::Mat compose_display_canvas(const cv::Mat& source)
         return canvas;
     }
 
-    cv::Mat resized = source;
-    int scaled_width = source.cols;
-    int scaled_height = source.rows;
-
-    if (source.cols > kDisplayWidth || source.rows > kDisplayHeight) {
-        const double fit_scale = std::min(static_cast<double>(kDisplayWidth) / static_cast<double>(source.cols),
-                                          static_cast<double>(kDisplayHeight) / static_cast<double>(source.rows));
-        scaled_width = std::max(1, static_cast<int>(std::round(source.cols * fit_scale)));
-        scaled_height = std::max(1, static_cast<int>(std::round(source.rows * fit_scale)));
-        cv::resize(source, resized, cv::Size(scaled_width, scaled_height), 0.0, 0.0, cv::INTER_AREA);
-    }
+    const double fit_scale = std::min(static_cast<double>(kDisplayWidth) / static_cast<double>(source.cols),
+                                      static_cast<double>(kDisplayHeight) / static_cast<double>(source.rows));
+    const int scaled_width = std::max(1, static_cast<int>(std::round(source.cols * fit_scale)));
+    const int scaled_height = std::max(1, static_cast<int>(std::round(source.rows * fit_scale)));
+    cv::Mat resized;
+    const int interp = fit_scale >= 1.0 ? cv::INTER_NEAREST : cv::INTER_AREA;
+    cv::resize(source, resized, cv::Size(scaled_width, scaled_height), 0.0, 0.0, interp);
 
     const int offset_x = (kDisplayWidth - scaled_width) / 2;
     const int offset_y = (kDisplayHeight - scaled_height) / 2;
