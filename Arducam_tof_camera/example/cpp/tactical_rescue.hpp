@@ -6,8 +6,6 @@
 #include <vector>
 
 #include <opencv2/core.hpp>
-#include <opencv2/dnn.hpp>
-#include <opencv2/videoio.hpp>
 
 namespace tactical_rescue {
 
@@ -16,19 +14,14 @@ constexpr int kFrameTimeoutMs = 200;
 constexpr float kMinDepthMm = 200.0f;
 constexpr int kDisplayWidth = 1920;
 constexpr int kDisplayHeight = 1080;
-constexpr int kMaxDisplayScale = 4;
-constexpr int kDefaultDetectorInput = 300;
 constexpr int kMaxRenderedPeople = 6;
-constexpr const char* kDefaultSsdModelPath =
-    "/home/admin/Desktop/Arducam_tof_camera/models/tensorflow_coco_ssd/frozen_inference_graph.pb";
-constexpr const char* kDefaultSsdConfigPath =
-    "/home/admin/Desktop/Arducam_tof_camera/models/tensorflow_coco_ssd/graph.pbtxt";
-constexpr int kCocoPersonClassId = 1;
-constexpr int kDefaultDetectionFps = 3;
+constexpr int kDefaultDetectionFps = 6;
+constexpr int kDefaultAm2302Gpio = 4;
+constexpr const char* kDefaultAm2302HelperPath =
+    "/home/admin/Desktop/Arducam_tof_camera/example/python/am2302_stream.py";
 
 enum class DetectorSource {
     AUTO,
-    RGB,
     AMPLITUDE,
     CONFIDENCE,
     PSEUDO,
@@ -36,25 +29,20 @@ enum class DetectorSource {
 
 struct Options {
     int device = 0;
-    int rgb_device = 0;
-    int rgb_width = 640;
-    int rgb_height = 480;
     int range_mm = kDefaultRangeMm;
     int confidence_threshold = 30;
     int min_depth_mm = static_cast<int>(kMinDepthMm);
     int max_depth_mm = kDefaultRangeMm;
     int hud_scale = 3;
-    int detector_input = kDefaultDetectorInput;
     int detection_fps = kDefaultDetectionFps;
+    int am2302_gpio = kDefaultAm2302Gpio;
     int max_people = 4;
     float person_confidence = 0.50f;
-    float nms_threshold = 0.45f;
     bool no_preview = false;
     bool show_detector_input = false;
-    bool rgb_libcamera = false;
+    bool enable_am2302 = true;
     DetectorSource detector_source = DetectorSource::AUTO;
-    std::string model_path = kDefaultSsdModelPath;
-    std::string config_path = kDefaultSsdConfigPath;
+    std::string am2302_helper_path = kDefaultAm2302HelperPath;
 };
 
 class LineFilter {
@@ -85,12 +73,6 @@ struct SharedFrame {
     std::chrono::steady_clock::time_point captured_at;
 };
 
-struct SharedRgbFrame {
-    cv::Mat bgr;
-    uint64_t sequence = 0;
-    std::chrono::steady_clock::time_point captured_at;
-};
-
 struct PersonDetection {
     cv::Rect box;
     cv::Mat mask;
@@ -116,6 +98,13 @@ struct RuntimeStats {
     int detected_people = 0;
     float best_person_score = 0.0f;
     bool detector_uses_segmentation = false;
+    bool ambient_valid = false;
+    bool ambient_enabled = false;
+    float ambient_temperature_c = 0.0f;
+    float ambient_humidity_percent = 0.0f;
+    double ambient_age_s = 0.0;
+    std::chrono::steady_clock::time_point ambient_updated_at{};
+    std::string ambient_status = "OFF";
     std::string detector_source_label = "OFF";
 };
 
@@ -149,7 +138,6 @@ private:
 float clamp01(float value);
 
 bool file_exists(const std::string& path);
-bool open_rgb_capture(cv::VideoCapture& capture, const Options& opt, std::string& opened_path);
 
 const char* detector_source_label(DetectorSource source);
 cv::Mat to_gray_preview(const cv::Mat& depth_mm, const Options& opt);
@@ -159,9 +147,7 @@ cv::Mat build_wireframe_overlay(const cv::Mat& depth_mm, const cv::Mat& confiden
 cv::Mat build_amplitude_detector_input(const SharedFrame& lidar_frame, const Options& opt);
 cv::Mat build_confidence_detector_input(const SharedFrame& lidar_frame, const Options& opt);
 cv::Mat build_pseudo_detector_input(const SharedFrame& lidar_frame, const Options& opt);
-DetectionState run_person_detector(cv::dnn::Net& net, const SharedFrame& lidar_frame, const cv::Mat& detector_input,
-                                   const Options& opt, float* best_person_score_out = nullptr);
-DetectionState run_tof_person_detector(const SharedFrame& lidar_frame, const Options& opt,
+DetectionState run_tof_person_detector(const SharedFrame& lidar_frame, DetectorSource source, const Options& opt,
                                        float* best_person_score_out = nullptr);
 
 void draw_person_detection(cv::Mat& frame, const PersonDetection& detection, int index);

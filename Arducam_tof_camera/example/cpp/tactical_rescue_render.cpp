@@ -271,60 +271,96 @@ void draw_hud(cv::Mat& frame, const RuntimeStats& stats, const DetectionState& d
     const cv::Scalar text_color(230, 255, 235);
     const cv::Scalar dim_text(145, 210, 165);
 
-    draw_reference_grid(frame, ui);
-    fill_translucent_rect(frame, cv::Rect(0, 0, frame.cols, static_cast<int>(56 * ui)), cv::Scalar(0, 12, 6), 0.50);
-    fill_translucent_rect(frame, cv::Rect(0, frame.rows - static_cast<int>(44 * ui), frame.cols, static_cast<int>(44 * ui)),
-                          cv::Scalar(0, 10, 5), 0.46);
-
-    const int corner_len = std::max(18, static_cast<int>(std::round(28.0 * ui)));
-    draw_frame_corner(frame, cv::Point(16, 16), 1, 1, corner_len, 3, accent);
-    draw_frame_corner(frame, cv::Point(frame.cols - 17, 16), -1, 1, corner_len, 3, accent);
-    draw_frame_corner(frame, cv::Point(frame.cols - 17, frame.rows - 17), -1, -1, corner_len, 3, accent);
-    draw_frame_corner(frame, cv::Point(16, frame.rows - 17), 1, -1, corner_len, 3, accent);
-
     const PersonDetection* primary_detection = nullptr;
     if (detections.valid && !detections.people.empty() && detections.people.front().valid) {
         primary_detection = &detections.people.front();
-        draw_target_reticle(frame, *primary_detection, accent, ui);
     }
 
     const std::string mode_text = detector_enabled
                                       ? (primary_detection ? "TRACK LOCK" : "SCANNING")
                                       : "DETECTOR OFF";
     const std::string info_text = "IGNISXR NAV  |  " + stats.detector_source_label + "  |  " + mode_text;
-    const std::string perf_text = "FPS " + std::to_string(static_cast<int>(std::round(stats.render_fps))) +
-                                  "  AI " + std::to_string(static_cast<int>(std::round(stats.inference_ms))) + "ms  RANGE " +
-                                  std::to_string(static_cast<int>(std::round(stats.nearest_obstacle_mm))) + "mm";
+    const std::string perf_text =
+        "FPS " + std::to_string(static_cast<int>(std::round(stats.render_fps))) + "  DETECT " +
+        std::to_string(static_cast<int>(std::round(stats.inference_ms))) + "ms  RANGE " +
+        std::to_string(static_cast<int>(std::round(stats.nearest_obstacle_mm))) + "mm";
     const std::string people_text = "HUMANS " + std::to_string(stats.detected_people) + "  BEST " +
                                     std::to_string(static_cast<int>(std::round(stats.best_person_score * 100))) + "%";
 
-    cv::putText(frame, info_text, cv::Point(34, static_cast<int>(34 * ui)), cv::FONT_HERSHEY_SIMPLEX, 0.58 * ui,
+    fill_translucent_rect(frame, cv::Rect(18, 18, static_cast<int>(420 * ui), static_cast<int>(34 * ui)), cv::Scalar(0, 0, 0),
+                          0.45);
+    cv::putText(frame, info_text, cv::Point(28, static_cast<int>(40 * ui)), cv::FONT_HERSHEY_SIMPLEX, 0.58 * ui,
                 accent, 2, cv::LINE_AA);
-    cv::putText(frame, perf_text, cv::Point(34, frame.rows - static_cast<int>(18 * ui)), cv::FONT_HERSHEY_SIMPLEX,
+
+    fill_translucent_rect(frame,
+                          cv::Rect(18, frame.rows - static_cast<int>(58 * ui), static_cast<int>(520 * ui),
+                                   static_cast<int>(40 * ui)),
+                          cv::Scalar(0, 0, 0), 0.45);
+    cv::putText(frame, perf_text, cv::Point(28, frame.rows - static_cast<int>(28 * ui)), cv::FONT_HERSHEY_SIMPLEX,
                 0.50 * ui, text_color, 1, cv::LINE_AA);
     cv::putText(frame, people_text,
-                cv::Point(frame.cols - static_cast<int>(260 * ui), frame.rows - static_cast<int>(18 * ui)),
+                cv::Point(frame.cols - static_cast<int>(250 * ui), frame.rows - static_cast<int>(28 * ui)),
                 cv::FONT_HERSHEY_SIMPLEX, 0.50 * ui, dim_text, 1, cv::LINE_AA);
+
+    if (stats.ambient_enabled) {
+        const cv::Rect ambient_rect(frame.cols - static_cast<int>(340 * ui), static_cast<int>(28 * ui),
+                                    static_cast<int>(300 * ui), static_cast<int>(166 * ui));
+        fill_translucent_rect(frame, ambient_rect, cv::Scalar(0, 0, 0), 0.58);
+        cv::rectangle(frame, ambient_rect, accent, 1, cv::LINE_AA);
+        cv::putText(frame, "AM2302", cv::Point(ambient_rect.x + static_cast<int>(18 * ui),
+                                               ambient_rect.y + static_cast<int>(26 * ui)),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.48 * ui, accent, 1, cv::LINE_AA);
+
+        const std::string status_text = "STATUS " + stats.ambient_status;
+        cv::putText(frame, status_text,
+                    cv::Point(ambient_rect.x + static_cast<int>(18 * ui), ambient_rect.y + static_cast<int>(48 * ui)),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.42 * ui, dim_text, 1, cv::LINE_AA);
+
+        if (stats.ambient_valid) {
+            const std::string age_text = cv::format("AGE %.1fs", stats.ambient_age_s);
+
+            cv::putText(frame, "TEMP",
+                        cv::Point(ambient_rect.x + static_cast<int>(18 * ui), ambient_rect.y + static_cast<int>(78 * ui)),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.44 * ui, dim_text, 1, cv::LINE_AA);
+            cv::putText(frame, cv::format("%.1fC", stats.ambient_temperature_c),
+                        cv::Point(ambient_rect.x + static_cast<int>(18 * ui), ambient_rect.y + static_cast<int>(116 * ui)),
+                        cv::FONT_HERSHEY_SIMPLEX, 1.08 * ui, text_color, 2, cv::LINE_AA);
+
+            cv::putText(frame, "HUMIDITY",
+                        cv::Point(ambient_rect.x + static_cast<int>(160 * ui), ambient_rect.y + static_cast<int>(78 * ui)),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.44 * ui, dim_text, 1, cv::LINE_AA);
+            cv::putText(frame, cv::format("%.1f%%", stats.ambient_humidity_percent),
+                        cv::Point(ambient_rect.x + static_cast<int>(160 * ui), ambient_rect.y + static_cast<int>(116 * ui)),
+                        cv::FONT_HERSHEY_SIMPLEX, 1.08 * ui, text_color, 2, cv::LINE_AA);
+
+            cv::putText(frame, age_text,
+                        cv::Point(ambient_rect.x + static_cast<int>(18 * ui), ambient_rect.y + static_cast<int>(148 * ui)),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.42 * ui, dim_text, 1, cv::LINE_AA);
+        } else {
+            cv::putText(frame, "WAITING FOR SENSOR",
+                        cv::Point(ambient_rect.x + static_cast<int>(18 * ui), ambient_rect.y + static_cast<int>(106 * ui)),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.46 * ui, text_color, 1, cv::LINE_AA);
+        }
+    }
 }
 
 cv::Mat compose_display_canvas(const cv::Mat& source)
 {
-    cv::Mat canvas(kDisplayHeight, kDisplayWidth, CV_8UC3, cv::Scalar(1, 8, 4));
+    cv::Mat canvas(kDisplayHeight, kDisplayWidth, CV_8UC3, cv::Scalar(0, 0, 0));
     if (source.empty()) {
         return canvas;
     }
 
-    const int scale_x = kDisplayWidth / source.cols;
-    const int scale_y = kDisplayHeight / source.rows;
-    const int integer_scale = std::max(1, std::min(std::min(scale_x, scale_y), kMaxDisplayScale));
-    const int scaled_width = source.cols * integer_scale;
-    const int scaled_height = source.rows * integer_scale;
+    cv::Mat resized = source;
+    int scaled_width = source.cols;
+    int scaled_height = source.rows;
 
-    cv::Mat resized;
-    if (integer_scale == 1) {
-        resized = source;
-    } else {
-        cv::resize(source, resized, cv::Size(scaled_width, scaled_height), 0.0, 0.0, cv::INTER_LINEAR);
+    if (source.cols > kDisplayWidth || source.rows > kDisplayHeight) {
+        const double fit_scale = std::min(static_cast<double>(kDisplayWidth) / static_cast<double>(source.cols),
+                                          static_cast<double>(kDisplayHeight) / static_cast<double>(source.rows));
+        scaled_width = std::max(1, static_cast<int>(std::round(source.cols * fit_scale)));
+        scaled_height = std::max(1, static_cast<int>(std::round(source.rows * fit_scale)));
+        cv::resize(source, resized, cv::Size(scaled_width, scaled_height), 0.0, 0.0, cv::INTER_AREA);
     }
 
     const int offset_x = (kDisplayWidth - scaled_width) / 2;
