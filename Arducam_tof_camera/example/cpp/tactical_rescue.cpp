@@ -424,7 +424,7 @@ int main(int argc, char* argv[])
 
     if (!options.no_preview) {
         cv::namedWindow("tactical_rescue", cv::WINDOW_NORMAL);
-        cv::resizeWindow("tactical_rescue", kDisplayWidth, kDisplayHeight);
+        cv::setWindowProperty("tactical_rescue", cv::WND_PROP_FULLSCREEN, cv::WINDOW_FULLSCREEN);
         if (options.show_detector_input) {
             cv::namedWindow("detector_input", cv::WINDOW_NORMAL);
             cv::resizeWindow("detector_input", 900, 700);
