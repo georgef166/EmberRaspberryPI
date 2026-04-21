@@ -7,10 +7,10 @@
 example_cpp_extracted/
 
 # Nested project artifacts
-Arducam_tof_camera/.git/
-Arducam_tof_camera/.git_backup/
-Arducam_tof_camera/build/
-Arducam_tof_camera/venv/
-Arducam_tof_camera/**/venv/
-Arducam_tof_camera/**/__pycache__/
-Arducam_tof_camera/**/*.zip
+Ember/.git/
+Ember/.git_backup/
+Ember/build/
+Ember/venv/
+Ember/**/venv/
+Ember/**/__pycache__/
+Ember/**/*.zip

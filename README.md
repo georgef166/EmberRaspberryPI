@@ -24,7 +24,7 @@ Ember replaces this handheld heat-map with an individual, hands-free spatial awa
 
 **TensorFlow Lite** (tensorflow/lite C++ API v2.20) — runs Google's MobileNet SSD v1 COCO quantized person-detection model fully on-device on the Raspberry Pi 4B CPU. No network required, which is critical for deployment inside active structure fires where radio and network access are unavailable.
 
-- Model file: `Arducam_tof_camera/models/detect.tflite` (~4 MB)
+- Model file: `Ember/models/detect.tflite` (~4 MB)
 - Inference cadence: 8 FPS on the Pi's 4 ARM Cortex-A72 cores
 - Input: ToF amplitude channel (infrared reflection intensity) normalized to 300×300 uint8 RGB
 - Output: depth-validated person bounding boxes, rendered into the tactical HUD
@@ -34,7 +34,7 @@ Ember replaces this handheld heat-map with an individual, hands-free spatial awa
 ## Quick Start
 
 ```bash
-cd Arducam_tof_camera
+cd Ember
 ./Install_dependencies.sh
 sudo apt-get install -y libtensorflow-lite-dev
 ./compile.sh
@@ -43,7 +43,7 @@ QT_QPA_PLATFORM=xcb ./build/src/cpp/tactical_rescue
 
 A desktop launcher (`TacticalRescue.desktop`) is also provided for one-click operation.
 
-Full build instructions, architecture diagram, CLI options, and SDG alignment: see [`Arducam_tof_camera/README.md`](Arducam_tof_camera/README.md).
+Full build instructions, architecture diagram, CLI options, and SDG alignment: see [`Ember/README.md`](Ember/README.md).
 
 ---
 
@@ -51,7 +51,7 @@ Full build instructions, architecture diagram, CLI options, and SDG alignment: s
 
 ```
 EmberPI/
-├── Arducam_tof_camera/
+├── Ember/
 │   ├── src/cpp/                    Ember source + reference demos
 │   │   ├── tactical_rescue.cpp     Main orchestrator, 3-thread pipeline
 │   │   ├── tactical_rescue_tflite.cpp   Google TensorFlow Lite inference

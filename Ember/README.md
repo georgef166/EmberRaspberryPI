@@ -146,7 +146,7 @@ In `AUTO` mode, TFLite activates automatically when `models/detect.tflite` is pr
 ## Project Structure
 
 ```
-Arducam_tof_camera/
+Ember/
 ├── src/cpp/
 │   ├── tactical_rescue.cpp/hpp       # Main app
 │   ├── tactical_rescue_tflite.cpp/hpp # TensorFlow Lite integration

@@ -18,7 +18,7 @@ constexpr int kMaxRenderedPeople = 6;
 constexpr int kDefaultDetectionFps = 8;
 constexpr int kDefaultAm2302Gpio = 4;
 constexpr const char* kDefaultAm2302HelperPath =
-    "/home/admin/Desktop/Arducam_tof_camera/src/python/am2302_stream.py";
+    "/home/admin/Desktop/Ember/src/python/am2302_stream.py";
 
 enum class DetectorSource {
     AUTO,
@@ -44,7 +44,7 @@ struct Options {
     bool enable_am2302 = true;
     DetectorSource detector_source = DetectorSource::AUTO;
     std::string am2302_helper_path = kDefaultAm2302HelperPath;
-    std::string tflite_model_path = "/home/admin/Desktop/Arducam_tof_camera/models/detect.tflite";
+    std::string tflite_model_path = "/home/admin/Desktop/Ember/models/detect.tflite";
 };
 
 class LineFilter {
