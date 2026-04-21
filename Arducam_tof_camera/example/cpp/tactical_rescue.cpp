@@ -1,5 +1,6 @@
 #include "ArducamTOFCamera.hpp"
 #include "tactical_rescue.hpp"
+#include "tactical_rescue_tflite.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -126,6 +127,9 @@ bool parse_args(int argc, char* argv[], Options& opt)
         if (value == "pseudo") {
             return DetectorSource::PSEUDO;
         }
+        if (value == "tflite") {
+            return DetectorSource::TFLITE;
+        }
         std::cerr << "Unknown detector source: " << value << std::endl;
         std::exit(2);
     };
@@ -151,7 +155,8 @@ bool parse_args(int argc, char* argv[], Options& opt)
                 << "  --person-conf FLOAT      Human candidate confidence threshold (default 0.50)\n"
                 << "  --max-people NUM         Maximum rendered person detections\n"
                 << "  --detection-fps NUM      Detector cadence in frames per second\n"
-                << "  --detector-source MODE   auto | amplitude | confidence | pseudo\n"
+                << "  --detector-source MODE   auto | amplitude | confidence | pseudo | tflite\n"
+                << "  --tflite-model PATH      Path to TFLite SSD person detection model\n"
                 << "  --am2302-gpio NUM        BCM GPIO used for AM2302 data (default 4)\n"
                 << "  --no-am2302              Disable AM2302 ambient overlay\n"
                 << "  --hud-scale NUM          HUD scale factor\n"
@@ -177,6 +182,8 @@ bool parse_args(int argc, char* argv[], Options& opt)
             opt.detection_fps = std::max(1, std::atoi(require_value("--detection-fps")));
         } else if (arg == "--detector-source") {
             opt.detector_source = parse_detector_source(require_value("--detector-source"));
+        } else if (arg == "--tflite-model") {
+            opt.tflite_model_path = require_value("--tflite-model");
         } else if (arg == "--am2302-gpio") {
             opt.am2302_gpio = std::max(0, std::atoi(require_value("--am2302-gpio")));
         } else if (arg == "--no-am2302") {
@@ -235,18 +242,26 @@ int main(int argc, char* argv[])
     std::cout << "Tactical rescue feed active at " << info.width << "x" << info.height << " range " << actual_range
               << "mm" << std::endl;
 
+    TFLitePersonDetector tflite_detector;
+    const bool tflite_available = file_exists(options.tflite_model_path) &&
+                                  tflite_detector.load(options.tflite_model_path);
+
     DetectorSource active_detector_source = DetectorSource::CONFIDENCE;
-    if (options.detector_source == DetectorSource::CONFIDENCE) {
+    if (options.detector_source == DetectorSource::TFLITE) {
+        active_detector_source = DetectorSource::TFLITE;
+    } else if (options.detector_source == DetectorSource::CONFIDENCE) {
         active_detector_source = DetectorSource::CONFIDENCE;
     } else if (options.detector_source == DetectorSource::PSEUDO) {
         active_detector_source = DetectorSource::PSEUDO;
     } else if (options.detector_source == DetectorSource::AUTO) {
-        active_detector_source = DetectorSource::CONFIDENCE;
+        active_detector_source = tflite_available ? DetectorSource::TFLITE : DetectorSource::CONFIDENCE;
     } else {
         active_detector_source = DetectorSource::AMPLITUDE;
     }
 
-    if (active_detector_source == DetectorSource::CONFIDENCE) {
+    if (active_detector_source == DetectorSource::TFLITE) {
+        std::cout << "Detector: TensorFlow Lite SSD person detection" << std::endl;
+    } else if (active_detector_source == DetectorSource::CONFIDENCE) {
         std::cout << "Detector input using ToF confidence heuristic" << std::endl;
     } else if (active_detector_source == DetectorSource::PSEUDO) {
         std::cout << "Detector input using ToF pseudo composite heuristic" << std::endl;
@@ -403,8 +418,9 @@ int main(int argc, char* argv[])
             const auto infer_started = std::chrono::steady_clock::now();
             last_inference_started = infer_started;
             float best_person_score = 0.0f;
-            const DetectionState result =
-                run_tof_person_detector(lidar_input, active_detector_source, options, &best_person_score);
+            const DetectionState result = (active_detector_source == DetectorSource::TFLITE)
+                ? tflite_detector.detect(lidar_input, options, &best_person_score)
+                : run_tof_person_detector(lidar_input, active_detector_source, options, &best_person_score);
 
             {
                 std::lock_guard<std::mutex> lock(detection_mutex);

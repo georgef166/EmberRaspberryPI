@@ -15,7 +15,7 @@ constexpr float kMinDepthMm = 200.0f;
 constexpr int kDisplayWidth = 1920;
 constexpr int kDisplayHeight = 1080;
 constexpr int kMaxRenderedPeople = 6;
-constexpr int kDefaultDetectionFps = 6;
+constexpr int kDefaultDetectionFps = 8;
 constexpr int kDefaultAm2302Gpio = 4;
 constexpr const char* kDefaultAm2302HelperPath =
     "/home/admin/Desktop/Arducam_tof_camera/example/python/am2302_stream.py";
@@ -25,6 +25,7 @@ enum class DetectorSource {
     AMPLITUDE,
     CONFIDENCE,
     PSEUDO,
+    TFLITE,
 };
 
 struct Options {
@@ -43,6 +44,7 @@ struct Options {
     bool enable_am2302 = true;
     DetectorSource detector_source = DetectorSource::AUTO;
     std::string am2302_helper_path = kDefaultAm2302HelperPath;
+    std::string tflite_model_path = "/home/admin/Desktop/Arducam_tof_camera/models/detect.tflite";
 };
 
 class LineFilter {

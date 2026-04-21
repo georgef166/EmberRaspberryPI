@@ -12,6 +12,28 @@ float clamp01(float value)
     return std::max(0.0f, std::min(1.0f, value));
 }
 
+namespace {
+
+cv::Mat remove_small_components(const cv::Mat& mask, int min_area)
+{
+    if (mask.empty() || cv::countNonZero(mask) == 0) {
+        return mask.clone();
+    }
+
+    cv::Mat labels, stats, centroids;
+    const int components = cv::connectedComponentsWithStats(mask, labels, stats, centroids, 8, CV_32S);
+    cv::Mat filtered(mask.size(), CV_8U, cv::Scalar(0));
+    for (int label = 1; label < components; ++label) {
+        if (stats.at<int>(label, cv::CC_STAT_AREA) < min_area) {
+            continue;
+        }
+        filtered.setTo(255, labels == label);
+    }
+    return filtered;
+}
+
+} // namespace
+
 cv::Mat to_gray_preview(const cv::Mat& depth_mm, const Options& opt)
 {
     cv::Mat normalized(depth_mm.size(), CV_32F);
@@ -38,7 +60,10 @@ cv::Mat build_geometry_mask(const cv::Mat& depth_mm, const cv::Mat& confidence, 
 cv::Mat build_wireframe_overlay(const cv::Mat& depth_mm, const cv::Mat& confidence, const Options& opt,
                                 float& nearest_mm)
 {
-    const cv::Mat geometry_mask = build_geometry_mask(depth_mm, confidence, opt);
+    cv::Mat geometry_mask = build_geometry_mask(depth_mm, confidence, opt);
+    cv::morphologyEx(geometry_mask, geometry_mask, cv::MORPH_OPEN,
+                     cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3)));
+    geometry_mask = remove_small_components(geometry_mask, 20);
     cv::Mat overlay(depth_mm.size(), CV_8UC3, cv::Scalar(0, 0, 0));
     if (cv::countNonZero(geometry_mask) < 32) {
         nearest_mm = 0.0f;
@@ -48,16 +73,27 @@ cv::Mat build_wireframe_overlay(const cv::Mat& depth_mm, const cv::Mat& confiden
     cv::Mat depth_gray = to_gray_preview(depth_mm, opt);
     depth_gray.setTo(0, geometry_mask == 0);
 
+    cv::Mat confidence_u8;
+    confidence.convertTo(confidence_u8, CV_8U, 255.0 / 1024.0);
+    confidence_u8.setTo(0, geometry_mask == 0);
+
+    cv::Mat stable_mask = confidence >= static_cast<float>(std::min(255, opt.confidence_threshold + 12));
+    stable_mask.convertTo(stable_mask, CV_8U, 255.0);
+    cv::bitwise_and(stable_mask, geometry_mask, stable_mask);
+    stable_mask = remove_small_components(stable_mask, 24);
+    if (cv::countNonZero(stable_mask) >= 32) {
+        geometry_mask = stable_mask;
+        depth_gray.setTo(0, geometry_mask == 0);
+        confidence_u8.setTo(0, geometry_mask == 0);
+    }
+
     cv::Mat depth_smooth;
-    cv::GaussianBlur(depth_gray, depth_smooth, cv::Size(3, 3), 0.0);
+    cv::medianBlur(depth_gray, depth_smooth, 3);
+    cv::GaussianBlur(depth_smooth, depth_smooth, cv::Size(3, 3), 0.0);
     depth_smooth.setTo(0, geometry_mask == 0);
 
     cv::applyColorMap(depth_smooth, overlay, cv::COLORMAP_TURBO);
     overlay.setTo(cv::Scalar(0, 0, 0), geometry_mask == 0);
-
-    cv::Mat confidence_u8;
-    confidence.convertTo(confidence_u8, CV_8U, 255.0 / 1024.0);
-    confidence_u8.setTo(0, geometry_mask == 0);
 
     cv::Mat brightness;
     confidence_u8.convertTo(brightness, CV_32F, 0.35 / 255.0, 0.65);
@@ -73,8 +109,11 @@ cv::Mat build_wireframe_overlay(const cv::Mat& depth_mm, const cv::Mat& confiden
     }
 
     cv::Mat edges;
-    cv::Canny(depth_smooth, edges, 28.0, 84.0, 3, true);
+    cv::Canny(depth_smooth, edges, 42.0, 126.0, 3, true);
+    cv::bitwise_and(edges, geometry_mask, edges);
+    cv::morphologyEx(edges, edges, cv::MORPH_OPEN, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(2, 2)));
     cv::morphologyEx(edges, edges, cv::MORPH_CLOSE, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3)));
+    edges = remove_small_components(edges, 6);
     overlay.setTo(cv::Scalar(255, 255, 255), edges > 0);
 
     nearest_mm = 0.0f;
@@ -110,6 +149,16 @@ float rect_iou(const cv::Rect2f& lhs, const cv::Rect& rhs)
         return 0.0f;
     }
     return intersection_area / union_area;
+}
+
+cv::Point2f rect_center(const cv::Rect2f& rect)
+{
+    return cv::Point2f(rect.x + rect.width * 0.5f, rect.y + rect.height * 0.5f);
+}
+
+cv::Point2f rect_center(const cv::Rect& rect)
+{
+    return cv::Point2f(static_cast<float>(rect.x + rect.width * 0.5f), static_cast<float>(rect.y + rect.height * 0.5f));
 }
 
 cv::Rect blend_rect(const cv::Rect2f& previous, const cv::Rect& current)
@@ -190,24 +239,33 @@ void stabilize_temporal_detections(std::vector<PersonDetection>& detections, uin
                 continue;
             }
             const float iou = rect_iou(tracks[i].box, detection.box);
+            const cv::Point2f previous_center = rect_center(tracks[i].box);
+            const cv::Point2f current_center = rect_center(detection.box);
+            const float dx = previous_center.x - current_center.x;
+            const float dy = previous_center.y - current_center.y;
+            const float diagonal =
+                std::sqrt(tracks[i].box.width * tracks[i].box.width + tracks[i].box.height * tracks[i].box.height);
+            const float motion_distance_score =
+                clamp01(1.0f - std::sqrt(dx * dx + dy * dy) / std::max(28.0f, diagonal * 1.6f));
             const float depth_delta = (tracks[i].mean_depth_mm > 0.0f && detection.mean_depth_mm > 0.0f)
                                           ? std::abs(tracks[i].mean_depth_mm - detection.mean_depth_mm)
                                           : 0.0f;
-            const float depth_penalty = clamp01(depth_delta / 900.0f) * 0.15f;
-            const float match_score = iou - depth_penalty;
+            const float depth_penalty = clamp01(depth_delta / 1200.0f) * 0.10f;
+            const float match_score = std::max(iou, motion_distance_score) * 0.75f +
+                                      std::min(iou, motion_distance_score) * 0.25f - depth_penalty;
             if (match_score > best_match_score) {
                 best_match_score = match_score;
                 best_track = static_cast<int>(i);
             }
         }
 
-        if (best_track >= 0 && best_match_score > 0.10f) {
+        if (best_track >= 0 && best_match_score > 0.08f) {
             auto& track = tracks[best_track];
             track_claimed[static_cast<size_t>(best_track)] = true;
             track.box = cv::Rect2f(blend_rect(track.box, detection.box));
-            track.confidence = clamp01(track.confidence * 0.55f + detection.confidence * 0.45f);
+            track.confidence = clamp01(track.confidence * 0.42f + detection.confidence * 0.58f);
             track.mean_depth_mm = detection.mean_depth_mm > 0.0f
-                                      ? (track.mean_depth_mm > 0.0f ? track.mean_depth_mm * 0.45f + detection.mean_depth_mm * 0.55f
+                                      ? (track.mean_depth_mm > 0.0f ? track.mean_depth_mm * 0.35f + detection.mean_depth_mm * 0.65f
                                                                     : detection.mean_depth_mm)
                                       : track.mean_depth_mm;
             track.hits += 1;
@@ -217,7 +275,7 @@ void stabilize_temporal_detections(std::vector<PersonDetection>& detections, uin
             detection.box = cv::Rect(track.box);
             detection.mean_depth_mm = track.mean_depth_mm;
             detection.confidence = clamp01(std::max(detection.confidence, track.confidence) +
-                                           std::min(0.16f, 0.04f * static_cast<float>(track.hits - 1)));
+                                           std::min(0.20f, 0.05f * static_cast<float>(track.hits - 1)));
         } else {
             TemporalTrack track;
             track.box = cv::Rect2f(detection.box);
@@ -235,10 +293,10 @@ void stabilize_temporal_detections(std::vector<PersonDetection>& detections, uin
     }
 
     for (const auto& track : tracks) {
-        if (track.misses == 1 && track.hits >= 3 && track.confidence >= opt.person_confidence + 0.08f) {
+        if (track.misses <= 2 && track.hits >= 3 && track.confidence >= opt.person_confidence + 0.05f) {
             PersonDetection held;
             held.box = cv::Rect(track.box);
-            held.confidence = clamp01(track.confidence * 0.92f);
+            held.confidence = clamp01(track.confidence * (track.misses == 1 ? 0.94f : 0.86f));
             held.mean_depth_mm = track.mean_depth_mm;
             held.valid = true;
             best_confidence = std::max(best_confidence, held.confidence);
@@ -248,7 +306,7 @@ void stabilize_temporal_detections(std::vector<PersonDetection>& detections, uin
 
     detections.insert(detections.end(), synthetic_detections.begin(), synthetic_detections.end());
     tracks.erase(std::remove_if(tracks.begin(), tracks.end(),
-                                [](const TemporalTrack& track) { return track.misses > 3 || track.confidence < 0.08f; }),
+                                [](const TemporalTrack& track) { return track.misses > 5 || track.confidence < 0.08f; }),
                  tracks.end());
 }
 
@@ -430,6 +488,8 @@ const char* detector_source_label(DetectorSource source)
         return "CONF";
     case DetectorSource::PSEUDO:
         return "PSEUDO";
+    case DetectorSource::TFLITE:
+        return "TFLITE";
     case DetectorSource::AUTO:
     default:
         return "AUTO";
@@ -592,7 +652,7 @@ DetectionState run_tof_person_detector(const SharedFrame& lidar_frame, DetectorS
     const size_t percentile_index = depths.size() / 5;
     std::nth_element(depths.begin(), depths.begin() + static_cast<long>(percentile_index), depths.end());
     const float near_anchor = depths[percentile_index];
-    const float cutoff_depth = std::min(static_cast<float>(opt.max_depth_mm), near_anchor + 700.0f);
+    const float cutoff_depth = std::min(static_cast<float>(opt.max_depth_mm), near_anchor + 950.0f);
     const float confidence_floor = static_cast<float>(source == DetectorSource::CONFIDENCE
                                                           ? std::max(18, opt.confidence_threshold)
                                                           : std::max(12, opt.confidence_threshold / 2));
@@ -623,14 +683,14 @@ DetectionState run_tof_person_detector(const SharedFrame& lidar_frame, DetectorS
         const int y = stats.at<int>(label, cv::CC_STAT_TOP);
         const int width = stats.at<int>(label, cv::CC_STAT_WIDTH);
         const int height = stats.at<int>(label, cv::CC_STAT_HEIGHT);
-        if (area < 32 || area > frame_area / 3 || width <= 0 || height <= 0) {
+        if (area < 28 || area > static_cast<int>(frame_area * 0.58f) || width <= 0 || height <= 0) {
             continue;
         }
 
         const float aspect = static_cast<float>(width) / static_cast<float>(height);
         const float height_ratio = static_cast<float>(height) / static_cast<float>(reduced_depth.rows);
         const float fill_ratio = static_cast<float>(area) / static_cast<float>(width * height);
-        if (height_ratio < 0.15f || aspect < 0.18f || aspect > 1.20f || fill_ratio < 0.14f) {
+        if (height_ratio < 0.13f || aspect < 0.16f || aspect > 1.35f || fill_ratio < 0.12f) {
             continue;
         }
 
@@ -640,7 +700,7 @@ DetectionState run_tof_person_detector(const SharedFrame& lidar_frame, DetectorS
 
         const float center_bias = normalized_center_distance(reduced_box, reduced_depth.size());
         const float aspect_score = clamp01(1.0f - std::abs(aspect - 0.46f) / 0.55f);
-        const float height_score = clamp01(1.0f - std::abs(height_ratio - 0.34f) / 0.28f);
+        const float height_score = clamp01(1.0f - std::abs(height_ratio - 0.38f) / 0.34f);
         const float fill_score = clamp01(1.0f - std::abs(fill_ratio - 0.42f) / 0.34f);
         const float coverage = vertical_coverage_ratio(component_mask);
         const float continuity_score = clamp01((coverage - 0.42f) / 0.45f);
@@ -652,6 +712,9 @@ DetectionState run_tof_person_detector(const SharedFrame& lidar_frame, DetectorS
         const float shoulder_score = clamp01(1.0f - std::abs(shoulder_ratio - 1.35f) / 1.00f);
         const float support_ratio = bottom_width / std::max(1.0f, mid_width);
         const float support_score = clamp01(1.0f - std::abs(support_ratio - 0.95f) / 0.90f);
+        const float central_boost =
+            clamp01(1.0f - std::abs((reduced_box.x + reduced_box.width * 0.5f) - reduced_depth.cols * 0.5f) /
+                              std::max(1.0f, reduced_depth.cols * 0.38f));
 
         cv::Scalar mean_depth_reduced, std_depth_reduced;
         cv::meanStdDev(reduced_depth(reduced_box), mean_depth_reduced, std_depth_reduced, component_mask);
@@ -669,7 +732,7 @@ DetectionState run_tof_person_detector(const SharedFrame& lidar_frame, DetectorS
 
         const bool touches_edge = (x <= 1) || (y <= 1) || (x + width >= reduced_depth.cols - 1) ||
                                   (y + height >= reduced_depth.rows - 1);
-        const float edge_score = touches_edge ? 0.45f : 1.0f;
+        const float edge_penalty = touches_edge ? 0.08f : 0.0f;
 
         const float scale_x = static_cast<float>(lidar_frame.depth_mm.cols) / static_cast<float>(reduced_depth.cols);
         const float scale_y = static_cast<float>(lidar_frame.depth_mm.rows) / static_cast<float>(reduced_depth.rows);
@@ -685,13 +748,13 @@ DetectionState run_tof_person_detector(const SharedFrame& lidar_frame, DetectorS
                                       ? 1.0f - std::min(1.0f, (mean_depth - opt.min_depth_mm) /
                                                                   std::max(1.0f, static_cast<float>(opt.max_depth_mm - opt.min_depth_mm)))
                                       : 0.0f;
-        const float score = 0.20f * aspect_score + 0.14f * height_score + 0.10f * fill_score +
-                            0.14f * continuity_score + 0.12f * shoulder_score + 0.10f * support_score +
-                            0.10f * depth_consistency_score + 0.04f * center_bias + 0.03f * depth_score +
-                            0.03f * motion_score + 0.00f * edge_score;
-        const float confidence = clamp01((score - 0.20f) / 0.45f);
+        const float score = 0.16f * aspect_score + 0.15f * height_score + 0.10f * fill_score +
+                            0.12f * continuity_score + 0.10f * shoulder_score + 0.08f * support_score +
+                            0.10f * depth_consistency_score + 0.09f * center_bias + 0.05f * central_boost +
+                            0.06f * depth_score + 0.07f * motion_score - edge_penalty;
+        const float confidence = clamp01((score - 0.16f) / 0.50f);
         best_confidence = std::max(best_confidence, confidence);
-        if (score < 0.28f || confidence < 0.18f) {
+        if (score < 0.24f || confidence < 0.16f) {
             continue;
         }
 
