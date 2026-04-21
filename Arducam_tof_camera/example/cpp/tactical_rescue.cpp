@@ -242,6 +242,11 @@ int main(int argc, char* argv[])
     std::cout << "Tactical rescue feed active at " << info.width << "x" << info.height << " range " << actual_range
               << "mm" << std::endl;
 
+    // --- GOOGLE TECHNOLOGY: TensorFlow Lite ---
+    // Load the TFLite MobileNet SSD person detection model at startup.
+    // If models/detect.tflite is present, AUTO mode activates TFLite as the
+    // primary detector. Falls back to classical CV heuristics if absent.
+    // See tactical_rescue_tflite.cpp for the full inference pipeline.
     TFLitePersonDetector tflite_detector;
     const bool tflite_available = file_exists(options.tflite_model_path) &&
                                   tflite_detector.load(options.tflite_model_path);
@@ -254,6 +259,7 @@ int main(int argc, char* argv[])
     } else if (options.detector_source == DetectorSource::PSEUDO) {
         active_detector_source = DetectorSource::PSEUDO;
     } else if (options.detector_source == DetectorSource::AUTO) {
+        // AUTO: prefer TFLite (Google) when model is present, fall back to CV heuristic
         active_detector_source = tflite_available ? DetectorSource::TFLITE : DetectorSource::CONFIDENCE;
     } else {
         active_detector_source = DetectorSource::AMPLITUDE;
@@ -418,6 +424,7 @@ int main(int argc, char* argv[])
             const auto infer_started = std::chrono::steady_clock::now();
             last_inference_started = infer_started;
             float best_person_score = 0.0f;
+            // [GOOGLE TFLITE] Route to TFLite inference or classical CV fallback
             const DetectionState result = (active_detector_source == DetectorSource::TFLITE)
                 ? tflite_detector.detect(lidar_input, options, &best_person_score)
                 : run_tof_person_detector(lidar_input, active_detector_source, options, &best_person_score);
