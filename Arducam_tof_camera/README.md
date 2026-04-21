@@ -95,19 +95,19 @@ A one-click launcher is provided at `TacticalRescue.desktop` on the Desktop. Dou
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                    tactical_rescue                       │
+│                    tactical_rescue                      │
 │                                                         │
-│  ┌──────────────┐   ┌──────────────────┐   ┌─────────┐ │
-│  │ Capture      │   │ Inference Thread  │   │ Render  │ │
-│  │ Thread       │──▶│                  │──▶│ Thread  │ │
-│  │              │   │ TFLiteDetector   │   │         │ │
-│  │ Arducam ToF  │   │ (TensorFlow Lite)│   │ OpenCV  │ │
-│  │ 240×180      │   │ MobileNet SSD v1 │   │ HUD     │ │
-│  │ depth_mm     │   │ person detection │   │ overlay │ │
-│  │ confidence   │   │                  │   │         │ │
-│  │ amplitude    │   │ Classical CV     │   │         │ │
-│  │              │   │ fallback         │   │         │ │
-│  └──────────────┘   └──────────────────┘   └─────────┘ │
+│  ┌──────────────┐   ┌──────────────────┐   ┌─────────┐  │
+│  │ Capture      │   │ Inference Thread │   │ Render  │  │
+│  │ Thread       │──▶│                  │──▶│ Thread  │  │
+│  │              │   │ TFLiteDetector   │   │         │  │
+│  │ Arducam ToF  │   │ (TensorFlow Lite)│   │ OpenCV  │  │
+│  │ 240×180      │   │ MobileNet SSD v1 │   │ HUD     │  │
+│  │ depth_mm     │   │ person detection │   │ overlay │  │
+│  │ confidence   │   │                  │   │         │  │
+│  │ amplitude    │   │ Classical CV     │   │         │  │
+│  │              │   │ fallback         │   │         │  │
+│  └──────────────┘   └──────────────────┘   └─────────┘  │
 │                                                         │
 │  ┌──────────────┐                                       │
 │  │ AM2302       │  Temperature/humidity overlay         │
