@@ -16,14 +16,14 @@ if cmake --build "$build_dir" --config Release --target tactical_rescue -j 4 &&
     cmake --build "$build_dir" --config Release --target preview_depth -j 4 &&
     cmake --build "$build_dir" --config Release --target capture_raw -j 4; then
     echo "== Build success"
-    echo "== Run $build_dir/example/cpp/tactical_rescue"
+    echo "== Run $build_dir/src/cpp/tactical_rescue"
 else
     echo "== Retry build without -j 4"
     if cmake --build "$build_dir" --config Release --target tactical_rescue &&
         cmake --build "$build_dir" --config Release --target preview_depth &&
         cmake --build "$build_dir" --config Release --target capture_raw; then
         echo "== Build success"
-        echo "== Run $build_dir/example/cpp/tactical_rescue"
+        echo "== Run $build_dir/src/cpp/tactical_rescue"
     else
         echo "== Build failed"
     fi

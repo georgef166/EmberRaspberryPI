@@ -17,7 +17,7 @@ build/
 *.zip
 
 # Misc
-/example/python/*.json
+/src/python/*.json
 *.patch
 /*.json
 /cali.bin

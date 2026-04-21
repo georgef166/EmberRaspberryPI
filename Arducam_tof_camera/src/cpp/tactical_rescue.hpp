@@ -18,7 +18,7 @@ constexpr int kMaxRenderedPeople = 6;
 constexpr int kDefaultDetectionFps = 8;
 constexpr int kDefaultAm2302Gpio = 4;
 constexpr const char* kDefaultAm2302HelperPath =
-    "/home/admin/Desktop/Arducam_tof_camera/example/python/am2302_stream.py";
+    "/home/admin/Desktop/Arducam_tof_camera/src/python/am2302_stream.py";
 
 enum class DetectorSource {
     AUTO,

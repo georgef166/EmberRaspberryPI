@@ -56,7 +56,7 @@ make tactical_rescue
 ## Run
 
 ```bash
-QT_QPA_PLATFORM=xcb ./build/example/cpp/tactical_rescue
+QT_QPA_PLATFORM=xcb ./build/src/cpp/tactical_rescue
 ```
 
 The `QT_QPA_PLATFORM=xcb` flag forces the X11 display backend — required on Raspberry Pi OS with Wayland enabled.
@@ -147,7 +147,7 @@ In `AUTO` mode, TFLite activates automatically when `models/detect.tflite` is pr
 
 ```
 Arducam_tof_camera/
-├── example/cpp/
+├── src/cpp/
 │   ├── tactical_rescue.cpp/hpp       # Main app
 │   ├── tactical_rescue_tflite.cpp/hpp # TensorFlow Lite integration
 │   ├── tactical_rescue_perception.cpp # Classical CV fallback
@@ -158,7 +158,7 @@ Arducam_tof_camera/
 ├── models/
 │   ├── detect.tflite                 # MobileNet SSD v1 COCO (TFLite)
 │   └── labelmap.txt                  # COCO class labels
-└── example/python/
+└── src/python/
     └── am2302_stream.py              # AM2302 sensor helper
 ```
 
