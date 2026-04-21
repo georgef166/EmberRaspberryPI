@@ -1,0 +1,8 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Tactical Rescue
+Exec=env QT_QPA_PLATFORM=xcb /home/admin/Desktop/Arducam_tof_camera/build/src/cpp/tactical_rescue
+Icon=camera
+Terminal=false
+StartupNotify=false

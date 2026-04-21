@@ -14,5 +14,4 @@ set(CXXLIBS ArducamDepthCamera::ArducamDepthCamera)
 # include_directories("/usr/local/include")
 # link_directories("/usr/local/lib")
 
-add_subdirectory(example)
-add_subdirectory(open3d_preview)
+add_subdirectory(src)

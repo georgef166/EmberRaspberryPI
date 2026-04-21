@@ -1,147 +1,178 @@
-# Arducam Depth Camera
+# Ember — Tactical Geometry HUD for Structural Firefighting
 
-**Note: Since our support channels are primarily via email, please send an email to support@arducam.com if you have any questions.   
-Asking questions in the issues may not get noticed!!!**
-## Overview
+Ember is a helmet-mounted heads-up display for structural firefighters. It processes real-time Time-of-Flight (ToF) depth data on a Raspberry Pi 4B to produce a high-contrast spatial wireframe overlay — mapping the physical geometry of a room through dense smoke where standard optics and thermal imaging fail. A TensorFlow Lite inference pipeline autonomously detects and outlines victims in real time, hands-free.
 
-This project is a use example based on arducam's depth camera. It includes basic image rendering using opencv, displaying 3D point clouds using PCL, and publishing depth camera data through the ROS2 system.
-The depth camera is the depth data obtained by calculating the phase difference based on the transmitted modulated pulse. The resolution of the camera is 240*180. Currently, it has two range modes: 2 meters and 4 meters. The measurement error is within 2 cm.
-The depth camera supports CSI and USB two connection methods, and needs an additional 5V 2A current power supply for the camera.
+---
 
-## Quick Start
+## The Problem
 
-### Clone this repository
+In structural firefighting, smoke routinely drops visibility below 15cm, rendering human sight and standard cameras useless. Teams rely on a single shared handheld thermal imaging camera (TIC) — one that occupies a hand, washes out in high-heat environments where all surfaces merge into a uniform signature, and provides no spatial geometry for navigation. Ember addresses this by giving every firefighter individual, hands-free spatial awareness and real-time victim detection.
 
-Clone this repository and enter the directory.
+---
 
-```shell
-  git clone https://github.com/ArduCAM/Arducam_tof_camera.git
-  cd Arducam_tof_camera
+## Google Technology
+
+**TensorFlow Lite** (TFLite) — `tensorflow/lite` C++ API v2.20  
+- Model: MobileNet SSD v1 COCO quantized (`models/detect.tflite`, 4MB)
+- Runs fully on-device — no network required in the field
+- Processes the ToF amplitude channel (normalized grayscale → 300×300 RGB) at the configured detection FPS
+- Detected person bounding boxes are depth-validated against the live depth frame before rendering
+- Falls back to classical ToF heuristics if no model file is present
+
+---
+
+## Hardware Requirements
+
+| Component | Spec |
+|---|---|
+| Raspberry Pi 4B | 4GB RAM recommended |
+| Arducam ToF Camera | 240×180, CSI or USB, up to 4m range |
+| AM2302 sensor | Optional — temperature/humidity overlay |
+| Display | Any HDMI display or compatible glasses/HMD |
+
+---
+
+## Dependencies
+
+Install all dependencies (run from repo root on Raspberry Pi):
+
+```bash
+./Install_dependencies.sh
+sudo apt-get install -y libtensorflow-lite-dev
 ```
 
+---
 
-## Arducam TOF Camera API Documentation
+## Build
 
-For detailed API instructions, please refer to the official documentation:
-[Arducam TOF Camera Getting Started](https://www.arducam.com/docs/tof-camera-getting-started/)
-
-
-### Install dependencies for Raspberry Pi
-
-> Run in the Arducam_tof_camera folder
-> Whatever you want to run the C/C++ examples or Python examples, you need to install the dependencies.
-
-```shell
-  ./Install_dependencies.sh
+```bash
+mkdir -p build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release
+make tactical_rescue
 ```
 
-> Run the setup_rock_5a.sh if on rock 5a platform.
+---
 
-```shell
-  ./setup_rock_5a.sh
+## Run
+
+```bash
+QT_QPA_PLATFORM=xcb ./build/src/cpp/tactical_rescue
 ```
 
-### Install dependencies for Jetson
+The `QT_QPA_PLATFORM=xcb` flag forces the X11 display backend — required on Raspberry Pi OS with Wayland enabled.
 
-> Run in the Arducam_tof_camera folder
-> Whatever you want to run the C/C++ examples or Python examples, you need to install the dependencies.
+On launch the app will:
+1. Open the ToF camera
+2. Load `models/detect.tflite` automatically — TFLite person detection activates if the model file is present
+3. Open a fullscreen window with the live Tactical Geometry feed and HUD
 
-```shell
-  ./Install_dependencies_jetson.sh
+### Desktop Launcher
+
+A one-click launcher is provided at `TacticalRescue.desktop` on the Desktop. Double-click and select "Execute".
+
+---
+
+## CLI Options
+
+```
+--detector-source MODE    auto | amplitude | confidence | pseudo | tflite
+--tflite-model PATH       Path to TFLite model (default: models/detect.tflite)
+--range MM                ToF range in mm (default: 4000)
+--min-depth MM            Ignore geometry closer than this (default: 200)
+--max-depth MM            Ignore geometry farther than this
+--person-conf FLOAT       TFLite detection confidence threshold (default: 0.50)
+--max-people NUM          Max simultaneous detections rendered (default: 4)
+--detection-fps NUM       Inference cadence in frames per second (default: 8)
+--no-am2302               Disable AM2302 ambient sensor overlay
+--hud-scale NUM           HUD element scale factor (default: 3)
+--no-preview              Run capture and inference headless
+--show-detector-input     Show the exact frame passed to the TFLite model
 ```
 
-## Run Examples
+---
 
-> Platform: Raspberry Pi or Jetson
+## Architecture
 
-### Depth Examples
-
-#### Python
-
-##### Run
-
-###### Python Example
-
-> Run in the example/python folder
-
-```shell
-  cd example/python
+```
+┌─────────────────────────────────────────────────────────┐
+│                    tactical_rescue                       │
+│                                                         │
+│  ┌──────────────┐   ┌──────────────────┐   ┌─────────┐ │
+│  │ Capture      │   │ Inference Thread  │   │ Render  │ │
+│  │ Thread       │──▶│                  │──▶│ Thread  │ │
+│  │              │   │ TFLiteDetector   │   │         │ │
+│  │ Arducam ToF  │   │ (TensorFlow Lite)│   │ OpenCV  │ │
+│  │ 240×180      │   │ MobileNet SSD v1 │   │ HUD     │ │
+│  │ depth_mm     │   │ person detection │   │ overlay │ │
+│  │ confidence   │   │                  │   │         │ │
+│  │ amplitude    │   │ Classical CV     │   │         │ │
+│  │              │   │ fallback         │   │         │ │
+│  └──────────────┘   └──────────────────┘   └─────────┘ │
+│                                                         │
+│  ┌──────────────┐                                       │
+│  │ AM2302       │  Temperature/humidity overlay         │
+│  │ Thread       │  (optional, via Python subprocess)    │
+│  └──────────────┘                                       │
+└─────────────────────────────────────────────────────────┘
 ```
 
-```shell
-  python3 preview_depth.py
-  #or
-  python3 capture_raw.py
+**Key files:**
+
+| File | Role |
+|---|---|
+| `tactical_rescue.cpp` | Main orchestrator, CLI parsing, thread management |
+| `tactical_rescue_capture.cpp` | ToF camera acquisition thread |
+| `tactical_rescue_perception.cpp` | Classical CV detector (depth/amplitude/confidence heuristics) |
+| `tactical_rescue_tflite.cpp` | **TensorFlow Lite** person detection pipeline |
+| `tactical_rescue_render.cpp` | Wireframe overlay composition and HUD rendering |
+| `models/detect.tflite` | MobileNet SSD v1 COCO quantized model (Google TFLite Model Zoo) |
+
+---
+
+## Detection Pipeline (TFLite)
+
+1. ToF amplitude frame (float32, 240×180) is normalized to uint8
+2. Resized to 300×300 and expanded to 3-channel RGB
+3. Fed into MobileNet SSD v1 COCO (quantized, 4 output tensors: boxes, classes, scores, count)
+4. Person detections (COCO class 1) above confidence threshold are filtered
+5. Bounding boxes scaled back to camera resolution
+6. Each box depth-validated against live `depth_mm` frame
+7. Passed to temporal stabilizer → renderer
+
+In `AUTO` mode, TFLite activates automatically when `models/detect.tflite` is present. When absent, the system falls back to the classical ToF geometry heuristic.
+
+---
+
+## Project Structure
+
+```
+Arducam_tof_camera/
+├── src/cpp/
+│   ├── tactical_rescue.cpp/hpp       # Main app
+│   ├── tactical_rescue_tflite.cpp/hpp # TensorFlow Lite integration
+│   ├── tactical_rescue_perception.cpp # Classical CV fallback
+│   ├── tactical_rescue_render.cpp    # Display and HUD
+│   ├── tactical_rescue_capture.cpp   # Camera acquisition
+│   ├── preview_depth.cpp             # Simple depth viewer
+│   └── capture_raw.cpp               # Raw frame export
+├── models/
+│   ├── detect.tflite                 # MobileNet SSD v1 COCO (TFLite)
+│   └── labelmap.txt                  # COCO class labels
+└── src/python/
+    └── am2302_stream.py              # AM2302 sensor helper
 ```
 
-#### C/C++
+---
 
-##### Compile
+## SDG Alignment
 
-> Run in the Arducam_tof_camera folder
+**SDG 3 — Good Health and Well-Being**  
+Ember directly reduces firefighter fatality and injury risk in zero-visibility structural fire conditions.
 
-```shell
-  ./compile.sh
-```
+**SDG 9 — Industry, Innovation and Infrastructure**  
+Demonstrates on-device AI inference on embedded hardware as a viable path for life-safety applications that cannot depend on cloud connectivity.
 
-##### Run
+---
 
-###### C Example
-
-> Run in the build/example/c folder
-
-```shell
-  cd build/example/c
-```
-
-```shell
-  ./preview_depth_c
-```
-
-###### C++ Example
-
-> Run in the build/example/cpp folder
-
-```shell
-  cd build/example/cpp
-```
-
-```shell
-  ./preview_depth
-  #or
-  ./capture_raw
-```
-
-### Point Cloud Examples
-
-<!-- #### Python -->
-
-#### C/C++
-
-##### Dependencies
-
-```Shell
-  sudo apt update
-  sudo apt-get install libopen3d-dev 
-```
-
-##### Compile
-
-> Run in the Arducam_tof_camera folder
-
-```shell
-  ./compile_pointcloud.sh
-```
-
-##### Run
-
-> Run in the build/open3d_preview folder
-> If you do not see a point cloud window, please try adding the environment variable `export MESA_GL_VERSION_OVERRIDE=4.5` before running the program.
-
-```shell
-  cd build/open3d_preview
-```
-
-```shell
-  ./preview_pointcloud
-```
+*Built for the GDG on Campus North America Solution Challenge 2026.*  
+*Google technology: TensorFlow Lite (tensorflow/lite C++ API v2.20, MobileNet SSD COCO)*
