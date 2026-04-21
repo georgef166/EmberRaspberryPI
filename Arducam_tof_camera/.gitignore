@@ -1,16 +1,23 @@
 .vscode/
 .xmake/
 
+# Python virtualenvs and cache
+venv/
+**/venv/
+__pycache__/
+*.pyc
+
+# Build artifacts
 py_arducam/
 CMakeFiles/
-
 build/
 
-/ros2_publisher/install/
-/ros2_publisher/log/
-/ros2_publisher/*.json
-/example/python/*.json
+# Local git backup / downloads
+.git_backup/
+*.zip
 
+# Misc
+/example/python/*.json
 *.patch
 /*.json
 /cali.bin
