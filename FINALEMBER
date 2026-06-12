@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -e
+
+cd /home/admin/Desktop/Ember
+exec ./run.sh --coral --stream "$@"

@@ -92,18 +92,11 @@ cv::Mat build_wireframe_overlay(const cv::Mat& depth_mm, const cv::Mat& confiden
     cv::GaussianBlur(depth_smooth, depth_smooth, cv::Size(3, 3), 0.0);
     depth_smooth.setTo(0, geometry_mask == 0);
 
-    cv::Mat blue;
-    cv::Mat green;
-    cv::Mat red;
-    depth_smooth.convertTo(blue, CV_8U, 0.20);
-    depth_smooth.convertTo(green, CV_8U, 0.78);
-    depth_smooth.convertTo(red, CV_8U, 0.30);
-    std::vector<cv::Mat> channels = {blue, green, red};
-    cv::merge(channels, overlay);
+    cv::applyColorMap(depth_smooth, overlay, cv::COLORMAP_TURBO);
     overlay.setTo(cv::Scalar(0, 0, 0), geometry_mask == 0);
 
     cv::Mat brightness;
-    confidence_u8.convertTo(brightness, CV_32F, 0.76 / 255.0, 0.18);
+    confidence_u8.convertTo(brightness, CV_32F, 0.35 / 255.0, 0.65);
     for (int y = 0; y < overlay.rows; ++y) {
         cv::Vec3b* out_row = overlay.ptr<cv::Vec3b>(y);
         const float* gain_row = brightness.ptr<float>(y);
@@ -122,7 +115,7 @@ cv::Mat build_wireframe_overlay(const cv::Mat& depth_mm, const cv::Mat& confiden
     cv::morphologyEx(edges, edges, cv::MORPH_CLOSE, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3)));
     edges = remove_small_components(edges, 6);
     cv::dilate(edges, edges, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(2, 2)));
-    overlay.setTo(cv::Scalar(80, 255, 170), edges > 0);
+    overlay.setTo(cv::Scalar(255, 255, 255), edges > 0);
 
     nearest_mm = 0.0f;
     double min_depth = 0.0;
