@@ -11,14 +11,15 @@ target_link_libraries(preview_depth ${CXXLIBS} ${OpenCV_LIBS})
 add_executable(capture_raw capture_raw.cpp)
 target_link_libraries(capture_raw ${CXXLIBS} ${OpenCV_LIBS})
 
-# Google Technology: TensorFlow Lite (libtensorflow-lite v2.20)
-# Used for on-device MobileNet SSD person detection in tactical_rescue_tflite.cpp
-find_library(TFLITE_LIB tensorflow-lite REQUIRED)
+# Google Technology: TensorFlow Lite (libtensorflow-lite) — optional.
+# Powers the on-device MobileNet SSD person detector. There is no apt package
+# for the C++ library on Raspberry Pi OS (it must be built from source), so this
+# is intentionally NOT marked REQUIRED — the ToF, thermal, and classical CV
+# detectors all build and run without it.
+find_library(TFLITE_LIB tensorflow-lite)
+find_path(TFLITE_INCLUDE_DIR tensorflow/lite/interpreter.h)
 
-# Google Coral Edge TPU (libedgetpu) — optional.
-# When present, the tactical_rescue binary gains the --edgetpu backend that
-# offloads inference to an attached Coral. The build still succeeds without it
-# (CPU-only), so this is intentionally NOT marked REQUIRED.
+# Google Coral Edge TPU (libedgetpu) — optional, and requires TFLite.
 find_library(EDGETPU_LIB edgetpu)
 
 # MLX90640 thermal camera (libMLX90640) — optional.
@@ -39,15 +40,27 @@ add_executable(
     tactical_rescue_thermal.cpp  # MLX90640 thermal capture + warm-body detector
 )
 target_include_directories(tactical_rescue PRIVATE /usr/include)
-# Link TensorFlow Lite (Google) alongside OpenCV and the Arducam SDK
-target_link_libraries(tactical_rescue ${CXXLIBS} ${OpenCV_LIBS} ${TFLITE_LIB})
+target_link_libraries(tactical_rescue ${CXXLIBS} ${OpenCV_LIBS})
 
-if(EDGETPU_LIB)
-    message(STATUS "Coral Edge TPU support: ENABLED (${EDGETPU_LIB})")
-    target_compile_definitions(tactical_rescue PRIVATE EMBER_HAVE_EDGETPU=1)
-    target_link_libraries(tactical_rescue ${EDGETPU_LIB})
+# TensorFlow Lite (optional). The Coral backend lives under it: no TFLite, no Coral.
+if(TFLITE_LIB)
+    message(STATUS "TensorFlow Lite support: ENABLED (${TFLITE_LIB})")
+    target_compile_definitions(tactical_rescue PRIVATE EMBER_HAVE_TFLITE=1)
+    target_link_libraries(tactical_rescue ${TFLITE_LIB})
+    if(TFLITE_INCLUDE_DIR)
+        target_include_directories(tactical_rescue PRIVATE ${TFLITE_INCLUDE_DIR})
+    endif()
+
+    if(EDGETPU_LIB)
+        message(STATUS "Coral Edge TPU support: ENABLED (${EDGETPU_LIB})")
+        target_compile_definitions(tactical_rescue PRIVATE EMBER_HAVE_EDGETPU=1)
+        target_link_libraries(tactical_rescue ${EDGETPU_LIB})
+    else()
+        message(STATUS "Coral Edge TPU support: DISABLED (libedgetpu not found)")
+    endif()
 else()
-    message(STATUS "Coral Edge TPU support: DISABLED (libedgetpu not found; build is CPU-only)")
+    message(STATUS "TensorFlow Lite support: DISABLED (libtensorflow-lite not found; "
+                   "ToF + thermal + classical CV detectors still build). Coral also requires TFLite.")
 endif()
 
 if(MLX90640_LIB)

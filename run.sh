@@ -59,9 +59,11 @@ done
 
 # --- 1. Optional first-time setup (idempotent; the installers re-run safely) ---
 if [ "$DO_SETUP" = 1 ]; then
-    echo "== [1/3] Installing dependencies (ToF SDK, OpenCV, TensorFlow Lite)"
+    echo "== [1/3] Installing dependencies (ToF SDK, OpenCV)"
     ./Install_dependencies.sh || true     # may prompt to reboot; that's fine
-    sudo apt-get install -y libtensorflow-lite-dev
+    # NOTE: TensorFlow Lite has no apt package on Raspberry Pi OS — it is optional
+    # and built from source (see README). The ToF + thermal + CV detectors build
+    # without it, so we do not block setup on it here.
 
     echo "== Installing optional Coral Edge TPU support (skip errors if no Coral)"
     ./Install_coral.sh || echo "   (Coral setup skipped/failed — continuing)"

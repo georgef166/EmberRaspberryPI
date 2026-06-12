@@ -30,10 +30,17 @@
 
 #include "tactical_rescue_tflite.hpp"
 
+#include <iostream>
+
+// TensorFlow Lite is optional (no apt package on Raspberry Pi OS — built from
+// source). When libtensorflow-lite is absent at build time, EMBER_HAVE_TFLITE is
+// undefined and this file compiles to a stub so the ToF/thermal/CV pipeline still
+// builds; the TFLite (and Coral) detectors simply report unavailable at runtime.
+#ifdef EMBER_HAVE_TFLITE
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
-#include <iostream>
 
 #include <opencv2/imgproc.hpp>
 
@@ -275,3 +282,38 @@ DetectionState TFLitePersonDetector::detect(const SharedFrame& frame, const Opti
 }
 
 } // namespace tactical_rescue
+
+#else // EMBER_HAVE_TFLITE not defined — stub implementation
+
+namespace tactical_rescue {
+
+struct TFLitePersonDetector::Impl {};
+
+TFLitePersonDetector::TFLitePersonDetector() : impl_(nullptr) {}
+TFLitePersonDetector::~TFLitePersonDetector() = default;
+
+bool TFLitePersonDetector::load(const std::string& model_path, bool use_edgetpu)
+{
+    (void)model_path;
+    (void)use_edgetpu;
+    std::cerr << "[TFLite] Not compiled in (libtensorflow-lite not found at build time). "
+                 "Use --detector-source thermal or the ToF CV detectors instead." << std::endl;
+    return false;
+}
+
+bool TFLitePersonDetector::is_loaded() const { return false; }
+bool TFLitePersonDetector::uses_edgetpu() const { return false; }
+
+DetectionState TFLitePersonDetector::detect(const SharedFrame& frame, const Options& opt, float* best_score_out)
+{
+    (void)frame;
+    (void)opt;
+    if (best_score_out) {
+        *best_score_out = 0.0f;
+    }
+    return {};
+}
+
+} // namespace tactical_rescue
+
+#endif // EMBER_HAVE_TFLITE

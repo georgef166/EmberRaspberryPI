@@ -29,6 +29,8 @@ Ember replaces this handheld heat-map with an individual, hands-free spatial awa
 - Input: ToF amplitude channel (infrared reflection intensity) normalized to 300×300 uint8 RGB
 - Output: depth-validated person bounding boxes, rendered into the tactical HUD
 
+> **Optional dependency:** there is **no apt package** for the TensorFlow Lite C++ library on Raspberry Pi OS — it must be [built from source](https://www.tensorflow.org/lite/guide/build_cmake). The build auto-detects it (`EMBER_HAVE_TFLITE`) and, when absent, simply omits the TFLite/Coral detectors — the ToF, **thermal**, and classical CV detectors all build and run without it. The thermal warm-body detector is the recommended victim path anyway and needs no TFLite at all.
+
 **Google Coral Edge TPU** (`libedgetpu`, optional) — when a Coral is attached, the `--edgetpu` backend offloads inference to the Edge TPU, freeing all 4 CPU cores for ToF rendering and running a heavier model (SSD MobileNet **v2** COCO) at ~70+ FPS. Setup via `./Install_coral.sh`; the build auto-detects the Coral and falls back to CPU-only when absent.
 
 > **Note on detection quality:** the Coral accelerates inference and enables a heavier model, but it does not close the domain gap — the COCO model is trained on visible-light RGB while the input is the ToF amplitude (mono IR) channel. The largest accuracy gains will come from fine-tuning a detector on real ToF data, which the Coral can then run at high frame rates. The MLX90640 thermal channel (below) sidesteps this gap entirely.
@@ -90,7 +92,6 @@ cd Ember
 
 ```bash
 ./Install_dependencies.sh
-sudo apt-get install -y libtensorflow-lite-dev
 ./Install_coral.sh          # optional — only if a Google Coral is attached
 ./Install_thermal.sh        # optional — only if the MLX90640 thermal camera is attached
 ./compile.sh
