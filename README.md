@@ -70,6 +70,24 @@ Total bill of materials: **under $150** versus $5,000–$15,000 for a commercial
 
 ## Quick Start
 
+**One-shot script** — clone once, then everything (setup, build, launch) goes through `run.sh`:
+
+```bash
+cd ~/Desktop
+git clone https://github.com/georgef166/EmberRaspberryPI.git Ember
+cd Ember
+./run.sh --setup     # first time: install deps (+ optional Coral/Thermal), build, run
+                     # (reboot if prompted, then re-run ./run.sh)
+
+./run.sh             # everyday: build if needed, then launch
+./run.sh --coral     # launch on the Coral Edge TPU
+./run.sh --thermal   # launch with thermal-primary victim detection
+./run.sh --update    # git pull + rebuild + launch
+```
+
+<details>
+<summary>Or run each step manually</summary>
+
 ```bash
 ./Install_dependencies.sh
 sudo apt-get install -y libtensorflow-lite-dev
@@ -87,6 +105,8 @@ QT_QPA_PLATFORM=xcb ./build/src/cpp/tactical_rescue \
 # Thermal-primary victim detection (MLX90640)
 QT_QPA_PLATFORM=xcb ./build/src/cpp/tactical_rescue --detector-source thermal
 ```
+
+</details>
 
 The `QT_QPA_PLATFORM=xcb` flag forces the X11 display backend — required on Raspberry Pi OS with Wayland enabled.
 
