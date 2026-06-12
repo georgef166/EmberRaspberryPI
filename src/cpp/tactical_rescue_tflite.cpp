@@ -181,22 +181,27 @@ DetectionState TFLitePersonDetector::detect(const SharedFrame& frame, const Opti
 
     // --- INPUT PREPROCESSING FOR TFLITE ---
     // The ToF amplitude channel (infrared reflection intensity) is used as the
-    // model input — it captures scene structure through smoke where RGB cameras
-    // produce nothing. Falls back to depth_mm if amplitude is unavailable.
-    const cv::Mat& source = frame.amplitude.empty() ? frame.depth_mm : frame.amplitude;
+    // model input. Use the same valid-depth-masked, percentile-normalized, CLAHE
+    // enhanced image shown by --show-detector-input instead of raw frame min/max;
+    // raw min/max is unstable when invalid pixels or hot reflectors dominate.
+    cv::Mat detector_bgr = build_amplitude_detector_input(frame, opt);
+    if (detector_bgr.empty()) {
+        cv::Mat fallback_gray = to_gray_preview(frame.depth_mm, opt);
+        if (!frame.confidence.empty()) {
+            cv::Mat valid = build_geometry_mask(frame.depth_mm, frame.confidence, opt);
+            fallback_gray.setTo(0, valid == 0);
+        }
+        cv::cvtColor(fallback_gray, detector_bgr, cv::COLOR_GRAY2BGR);
+    }
+    if (detector_bgr.empty()) {
+        return state;
+    }
 
-    // Normalize float32 ToF data to uint8 range [0, 255] for TFLite quantized model
-    double min_val, max_val;
-    cv::minMaxLoc(source, &min_val, &max_val);
-    cv::Mat normalized;
-    source.convertTo(normalized, CV_8U, 255.0 / std::max(1.0, max_val - min_val),
-                     -min_val * 255.0 / std::max(1.0, max_val - min_val));
-
-    // Resize to 300x300 (MobileNet SSD input size) and replicate to 3-channel RGB
+    // Resize to the model input size and convert OpenCV BGR ordering to RGB.
     cv::Mat resized;
-    cv::resize(normalized, resized, cv::Size(impl_->input_w, impl_->input_h), 0, 0, cv::INTER_LINEAR);
+    cv::resize(detector_bgr, resized, cv::Size(impl_->input_w, impl_->input_h), 0, 0, cv::INTER_LINEAR);
     cv::Mat rgb;
-    cv::cvtColor(resized, rgb, cv::COLOR_GRAY2RGB);
+    cv::cvtColor(resized, rgb, cv::COLOR_BGR2RGB);
 
     // [TFLite] Write preprocessed frame into the model's input tensor
     const int input_idx = impl_->interpreter->inputs()[0];
@@ -254,7 +259,19 @@ DetectionState TFLitePersonDetector::detect(const SharedFrame& frame, const Opti
             continue;
         }
 
-        const float depth_mm = static_cast<float>(cv::mean(frame.depth_mm(box))[0]);
+        cv::Mat valid_depth = (frame.depth_mm(box) > static_cast<float>(opt.min_depth_mm)) &
+                              (frame.depth_mm(box) < static_cast<float>(opt.max_depth_mm));
+        valid_depth.convertTo(valid_depth, CV_8U, 255.0);
+        if (!frame.confidence.empty()) {
+            cv::Mat confident = frame.confidence(box) >= static_cast<float>(opt.confidence_threshold);
+            confident.convertTo(confident, CV_8U, 255.0);
+            cv::bitwise_and(valid_depth, confident, valid_depth);
+        }
+        if (cv::countNonZero(valid_depth) == 0) {
+            continue;
+        }
+
+        const float depth_mm = static_cast<float>(cv::mean(frame.depth_mm(box), valid_depth)[0]);
         if (depth_mm < static_cast<float>(opt.min_depth_mm) || depth_mm > static_cast<float>(opt.max_depth_mm)) {
             continue;
         }

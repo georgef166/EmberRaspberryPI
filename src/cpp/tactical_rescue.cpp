@@ -1,5 +1,6 @@
 #include "ArducamTOFCamera.hpp"
 #include "tactical_rescue.hpp"
+#include "tactical_rescue_stream.hpp"
 #include "tactical_rescue_tflite.hpp"
 #include "tactical_rescue_thermal.hpp"
 
@@ -161,8 +162,8 @@ bool parse_args(int argc, char* argv[], Options& opt)
                 << "  --detection-fps NUM      Detector cadence in frames per second\n"
                 << "  --detector-source MODE   auto | amplitude | confidence | pseudo | tflite | thermal\n"
                 << "  --tflite-model PATH      Path to TFLite SSD person detection model\n"
-                << "  --edgetpu                Run TFLite inference on the Coral Edge TPU\n"
-                << "  --person-class NUM       Model output index for 'person' (default 1; use 0 for Coral v2 COCO)\n"
+                << "  --edgetpu, --coral       Run TFLite inference on the Coral Edge TPU\n"
+                << "  --person-class NUM       Model output index for 'person' (default 1; Coral default 0)\n"
                 << "  --no-thermal             Disable the MLX90640 thermal overlay/detector\n"
                 << "  --thermal-address HEX    MLX90640 I2C address (default 0x33)\n"
                 << "  --thermal-refresh HZ     MLX90640 refresh rate: 1|2|4|8|16|32|64 (default 8)\n"
@@ -172,6 +173,11 @@ bool parse_args(int argc, char* argv[], Options& opt)
                 << "  --victim-temp-max C      Warm-body band upper bound (default 45)\n"
                 << "  --am2302-gpio NUM        BCM GPIO used for AM2302 data (default 4)\n"
                 << "  --no-am2302              Disable AM2302 ambient overlay\n"
+                << "  --stream                 Serve the rendered HUD over HTTP MJPEG\n"
+                << "  --stream-bind ADDR       Stream bind address (default 0.0.0.0)\n"
+                << "  --stream-port NUM        Stream HTTP port (default 8080)\n"
+                << "  --stream-fps NUM         Stream frame rate cap (default 10)\n"
+                << "  --stream-quality NUM     Stream JPEG quality 20-95 (default 75)\n"
                 << "  --hud-scale NUM          HUD scale factor\n"
                 << "  --show-detector-input    Show the exact image sent to the ToF detector\n"
                 << "  --no-preview             Run acquisition/inference without UI\n";
@@ -193,14 +199,17 @@ bool parse_args(int argc, char* argv[], Options& opt)
             opt.max_people = std::max(1, std::atoi(require_value("--max-people")));
         } else if (arg == "--detection-fps") {
             opt.detection_fps = std::max(1, std::atoi(require_value("--detection-fps")));
+            opt.detection_fps_explicit = true;
         } else if (arg == "--detector-source") {
             opt.detector_source = parse_detector_source(require_value("--detector-source"));
         } else if (arg == "--tflite-model") {
             opt.tflite_model_path = require_value("--tflite-model");
-        } else if (arg == "--edgetpu") {
+            opt.tflite_model_explicit = true;
+        } else if (arg == "--edgetpu" || arg == "--coral") {
             opt.edgetpu = true;
         } else if (arg == "--person-class") {
             opt.person_class_id = std::max(0, std::atoi(require_value("--person-class")));
+            opt.person_class_explicit = true;
         } else if (arg == "--no-thermal") {
             opt.enable_thermal = false;
         } else if (arg == "--thermal-address") {
@@ -219,6 +228,16 @@ bool parse_args(int argc, char* argv[], Options& opt)
             opt.am2302_gpio = std::max(0, std::atoi(require_value("--am2302-gpio")));
         } else if (arg == "--no-am2302") {
             opt.enable_am2302 = false;
+        } else if (arg == "--stream") {
+            opt.enable_stream = true;
+        } else if (arg == "--stream-bind") {
+            opt.stream_bind_address = require_value("--stream-bind");
+        } else if (arg == "--stream-port") {
+            opt.stream_port = std::max(1, std::atoi(require_value("--stream-port")));
+        } else if (arg == "--stream-fps") {
+            opt.stream_fps = std::max(1, std::atoi(require_value("--stream-fps")));
+        } else if (arg == "--stream-quality") {
+            opt.stream_jpeg_quality = std::max(20, std::min(95, std::atoi(require_value("--stream-quality"))));
         } else if (arg == "--hud-scale") {
             opt.hud_scale = std::max(1, std::atoi(require_value("--hud-scale")));
         } else if (arg == "--show-detector-input") {
@@ -233,21 +252,39 @@ bool parse_args(int argc, char* argv[], Options& opt)
     return true;
 }
 
+void apply_backend_defaults(Options& opt)
+{
+    if (!opt.edgetpu) {
+        return;
+    }
+
+    if (!opt.tflite_model_explicit) {
+        opt.tflite_model_path = kDefaultEdgeTpuModelPath;
+    }
+    if (!opt.person_class_explicit) {
+        opt.person_class_id = kDefaultEdgeTpuPersonClassId;
+    }
+    if (!opt.detection_fps_explicit) {
+        opt.detection_fps = kDefaultEdgeTpuDetectionFps;
+    }
+}
+
 } // namespace
 
 int main(int argc, char* argv[])
 {
     using namespace tactical_rescue;
 
-    LineFilter stdout_filter(STDOUT_FILENO);
-    LineFilter stderr_filter(STDERR_FILENO);
-    stdout_filter.start();
-    stderr_filter.start();
-
     Options options;
     if (!parse_args(argc, argv, options)) {
         return 0;
     }
+    apply_backend_defaults(options);
+
+    LineFilter stdout_filter(STDOUT_FILENO);
+    LineFilter stderr_filter(STDERR_FILENO);
+    stdout_filter.start();
+    stderr_filter.start();
 
     ArducamTOFCamera tof;
     if (tof.open(Connection::CSI, options.device)) {
@@ -279,8 +316,17 @@ int main(int argc, char* argv[])
     // primary detector. Falls back to classical CV heuristics if absent.
     // See tactical_rescue_tflite.cpp for the full inference pipeline.
     TFLitePersonDetector tflite_detector;
-    const bool tflite_available = file_exists(options.tflite_model_path) &&
-                                  tflite_detector.load(options.tflite_model_path, options.edgetpu);
+    const bool tflite_model_present = file_exists(options.tflite_model_path);
+    if (options.edgetpu && !tflite_model_present) {
+        std::cerr << "[Coral] Edge TPU requested, but model is missing: " << options.tflite_model_path << std::endl;
+        std::cerr << "[Coral] Run ./Install_coral.sh, then ./run.sh --rebuild --coral." << std::endl;
+    }
+    const bool tflite_available =
+        tflite_model_present && tflite_detector.load(options.tflite_model_path, options.edgetpu);
+    if (options.edgetpu && !tflite_available) {
+        std::cerr << "[Coral] Edge TPU detector unavailable; AUTO mode will fall back to thermal/ToF heuristics."
+                  << std::endl;
+    }
 
     // --- MLX90640 THERMAL ---
     // Open the thermal sensor. The thermal overlay and fire/hotspot warning
@@ -356,6 +402,12 @@ int main(int argc, char* argv[])
 
     FpsCounter capture_fps;
     FpsCounter render_fps;
+    MjpegStreamServer stream_server;
+    if (options.enable_stream &&
+        !stream_server.start(options.stream_bind_address, options.stream_port, options.stream_jpeg_quality)) {
+        std::cerr << "[stream] Remote feed disabled." << std::endl;
+        options.enable_stream = false;
+    }
 
     std::thread capture_thread([&] {
         uint64_t sequence = 0;
@@ -543,7 +595,13 @@ int main(int argc, char* argv[])
             stats.detected_people = static_cast<int>(result.people.size());
             stats.best_person_score = best_person_score;
             stats.detector_uses_segmentation = false;
-            stats.detector_source_label = std::string(detector_source_label(active_detector_source)) + " TOF";
+            if (active_detector_source == DetectorSource::TFLITE) {
+                stats.detector_source_label = tflite_detector.uses_edgetpu() ? "CORAL TFLITE" : "CPU TFLITE";
+            } else if (active_detector_source == DetectorSource::THERMAL) {
+                stats.detector_source_label = "THERMAL";
+            } else {
+                stats.detector_source_label = std::string(detector_source_label(active_detector_source)) + " TOF";
+            }
         }
     });
 
@@ -556,6 +614,7 @@ int main(int argc, char* argv[])
         }
     }
 
+    auto last_stream_publish = std::chrono::steady_clock::time_point::min();
     while (running) {
         SharedFrame frame;
         {
@@ -614,6 +673,15 @@ int main(int argc, char* argv[])
         }
         cv::Mat display = compose_display_canvas(hud);
         draw_hud(display, local_stats, detections, true, options.hud_scale);
+        if (options.enable_stream) {
+            const auto now = std::chrono::steady_clock::now();
+            const auto stream_period = std::chrono::milliseconds(1000 / std::max(1, options.stream_fps));
+            if (last_stream_publish == std::chrono::steady_clock::time_point::min() ||
+                now - last_stream_publish >= stream_period) {
+                stream_server.publish(display);
+                last_stream_publish = now;
+            }
+        }
 
         if (!options.no_preview) {
             cv::imshow("tactical_rescue", display);
@@ -649,6 +717,7 @@ int main(int argc, char* argv[])
 
     running = false;
     frame_cv.notify_all();
+    stream_server.stop();
 
     if (capture_thread.joinable()) {
         capture_thread.join();

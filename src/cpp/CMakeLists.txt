@@ -36,6 +36,7 @@ add_executable(
     tactical_rescue_capture.cpp
     tactical_rescue_perception.cpp
     tactical_rescue_render.cpp
+    tactical_rescue_stream.cpp  # Browser-viewable MJPEG HUD stream
     tactical_rescue_tflite.cpp   # Google TFLite inference pipeline
     tactical_rescue_thermal.cpp  # MLX90640 thermal capture + warm-body detector
 )

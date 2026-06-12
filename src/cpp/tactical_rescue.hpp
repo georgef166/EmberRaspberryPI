@@ -16,9 +16,19 @@ constexpr int kDisplayWidth = 1920;
 constexpr int kDisplayHeight = 1080;
 constexpr int kMaxRenderedPeople = 6;
 constexpr int kDefaultDetectionFps = 8;
+constexpr int kDefaultEdgeTpuDetectionFps = 30;
 constexpr int kDefaultAm2302Gpio = 4;
 constexpr const char* kDefaultAm2302HelperPath =
     "/home/admin/Desktop/Ember/src/python/am2302_stream.py";
+constexpr const char* kDefaultTfliteModelPath = "/home/admin/Desktop/Ember/models/detect.tflite";
+constexpr const char* kDefaultEdgeTpuModelPath =
+    "/home/admin/Desktop/Ember/models/ssd_mobilenet_v2_coco_edgetpu.tflite";
+constexpr int kDefaultCpuPersonClassId = 1;
+constexpr int kDefaultEdgeTpuPersonClassId = 0;
+constexpr int kDefaultStreamPort = 8080;
+constexpr int kDefaultStreamJpegQuality = 75;
+constexpr int kDefaultStreamFps = 10;
+constexpr const char* kDefaultStreamBindAddress = "0.0.0.0";
 
 enum class DetectorSource {
     AUTO,
@@ -49,12 +59,20 @@ struct Options {
     bool no_preview = false;
     bool show_detector_input = false;
     bool enable_am2302 = true;
+    bool enable_stream = false;
+    int stream_port = kDefaultStreamPort;
+    int stream_jpeg_quality = kDefaultStreamJpegQuality;
+    int stream_fps = kDefaultStreamFps;
+    std::string stream_bind_address = kDefaultStreamBindAddress;
     DetectorSource detector_source = DetectorSource::AUTO;
     bool edgetpu = false; // Run TFLite inference on the Coral Edge TPU instead of the Pi CPU
     // COCO "person" output index. The bundled 91-class detect.tflite uses 1
     // (index 0 = background "???"). The Coral ssd_mobilenet_v2_coco model uses
     // a 90-class 0-indexed labelmap where person = 0 — pass --person-class 0.
-    int person_class_id = 1;
+    int person_class_id = kDefaultCpuPersonClassId;
+    bool detection_fps_explicit = false;
+    bool person_class_explicit = false;
+    bool tflite_model_explicit = false;
     // --- MLX90640 thermal imaging ---
     bool enable_thermal = true;        // Read the MLX90640 and render the thermal overlay
     int thermal_address = kDefaultThermalAddress;
@@ -65,7 +83,7 @@ struct Options {
     float victim_temp_max_c = 45.0f;   // Warm-body band: upper bound (above => fire, not a person)
     float thermal_overlay_alpha = 0.45f;
     std::string am2302_helper_path = kDefaultAm2302HelperPath;
-    std::string tflite_model_path = "/home/admin/Desktop/Ember/models/detect.tflite";
+    std::string tflite_model_path = kDefaultTfliteModelPath;
 };
 
 class LineFilter {

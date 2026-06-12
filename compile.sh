@@ -5,7 +5,7 @@ workpath=$(cd "$(dirname "$0")" && pwd)
 
 echo "workpath: $workpath"
 
-if ! cmake -B "$workpath/build" -S "$workpath"; then
+if ! cmake -B "$workpath/build" -S "$workpath" -DCMAKE_BUILD_TYPE=Release; then
     echo "== CMake failed"
     exit 1
 fi

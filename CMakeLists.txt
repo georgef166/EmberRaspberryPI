@@ -5,7 +5,8 @@ project(TOFCameraExample)
 # /home/user/workspace/tof/arducam_tof_sdk/install/lib/cmake/ArducamDepthCamera/ArducamDepthCameraConfig.cmake
 # set(ArducamDepthCamera_DIR "/home/user/workspace/tof/arducam_tof_sdk/install/lib/cmake/ArducamDepthCamera")
 find_package(ArducamDepthCamera REQUIRED)
-set(CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(CLIBS ArducamDepthCamera::ArducamDepthCamera4C)
 set(CXXLIBS ArducamDepthCamera::ArducamDepthCamera)
