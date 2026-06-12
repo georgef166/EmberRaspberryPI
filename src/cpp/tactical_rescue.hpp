@@ -39,6 +39,12 @@ enum class DetectorSource {
     THERMAL,
 };
 
+enum class TfliteInputMode {
+    AMPLITUDE,
+    PSEUDO,
+    DEPTH,
+};
+
 // MLX90640-D55 far-infrared thermal array (32x24, I2C).
 constexpr int kThermalWidth = 32;
 constexpr int kThermalHeight = 24;
@@ -65,6 +71,7 @@ struct Options {
     int stream_fps = kDefaultStreamFps;
     std::string stream_bind_address = kDefaultStreamBindAddress;
     DetectorSource detector_source = DetectorSource::AUTO;
+    TfliteInputMode tflite_input_mode = TfliteInputMode::PSEUDO;
     bool edgetpu = false; // Run TFLite inference on the Coral Edge TPU instead of the Pi CPU
     // COCO "person" output index. The bundled 91-class detect.tflite uses 1
     // (index 0 = background "???"). The Coral ssd_mobilenet_v2_coco model uses

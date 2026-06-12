@@ -145,6 +145,7 @@ The CMake configure step prints `Coral Edge TPU support: ENABLED` when `libedget
 
 ```
 --detector-source MODE    auto | amplitude | confidence | pseudo | tflite | thermal
+--tflite-input MODE       pseudo | depth | amplitude-debug (default: pseudo, depth fallback)
 --tflite-model PATH        Path to TFLite model (default: models/detect.tflite; Coral default: models/ssd_mobilenet_v2_coco_edgetpu.tflite)
 --edgetpu, --coral         Run TFLite inference on the Coral Edge TPU
 --person-class NUM         Model output index for 'person' (default 1; Coral default 0)

@@ -69,6 +69,196 @@ static constexpr int kMaxDetections = 10;   // SSD model outputs up to 10 detect
 // COCO "person" output index is model-dependent (1 for the bundled 91-class
 // model, 0 for the Coral v2 COCO model) — supplied at runtime via opt.person_class_id.
 
+namespace {
+
+struct StableTfliteTrack {
+    cv::Rect2f box;
+    float confidence = 0.0f;
+    float mean_depth_mm = 0.0f;
+    int hits = 0;
+    int misses = 0;
+    uint64_t last_sequence = 0;
+};
+
+cv::Mat build_depth_detector_input(const SharedFrame& frame, const Options& opt)
+{
+    if (frame.depth_mm.empty()) {
+        return {};
+    }
+
+    cv::Mat depth_gray = to_gray_preview(frame.depth_mm, opt);
+    if (!frame.confidence.empty()) {
+        cv::Mat valid = build_geometry_mask(frame.depth_mm, frame.confidence, opt);
+        depth_gray.setTo(0, valid == 0);
+    }
+
+    cv::Mat depth_bgr;
+    cv::cvtColor(depth_gray, depth_bgr, cv::COLOR_GRAY2BGR);
+    return depth_bgr;
+}
+
+cv::Mat build_tflite_detector_input(const SharedFrame& frame, const Options& opt)
+{
+    cv::Mat detector_bgr;
+    if (opt.tflite_input_mode == TfliteInputMode::PSEUDO) {
+        detector_bgr = build_pseudo_detector_input(frame, opt);
+    } else if (opt.tflite_input_mode == TfliteInputMode::DEPTH) {
+        detector_bgr = build_depth_detector_input(frame, opt);
+    } else {
+        detector_bgr = build_amplitude_detector_input(frame, opt);
+    }
+
+    if (detector_bgr.empty() && opt.tflite_input_mode != TfliteInputMode::DEPTH) {
+        detector_bgr = build_depth_detector_input(frame, opt);
+    }
+    return detector_bgr;
+}
+
+float stable_rect_iou(const cv::Rect2f& lhs, const cv::Rect& rhs)
+{
+    const cv::Rect2f rhs_f(static_cast<float>(rhs.x), static_cast<float>(rhs.y), static_cast<float>(rhs.width),
+                           static_cast<float>(rhs.height));
+    const cv::Rect2f intersection = lhs & rhs_f;
+    if (intersection.width <= 0.0f || intersection.height <= 0.0f) {
+        return 0.0f;
+    }
+    const float intersection_area = intersection.width * intersection.height;
+    const float union_area = lhs.area() + rhs_f.area() - intersection_area;
+    return union_area > 0.0f ? intersection_area / union_area : 0.0f;
+}
+
+cv::Point2f stable_rect_center(const cv::Rect2f& rect)
+{
+    return cv::Point2f(rect.x + rect.width * 0.5f, rect.y + rect.height * 0.5f);
+}
+
+cv::Point2f stable_rect_center(const cv::Rect& rect)
+{
+    return cv::Point2f(static_cast<float>(rect.x) + static_cast<float>(rect.width) * 0.5f,
+                       static_cast<float>(rect.y) + static_cast<float>(rect.height) * 0.5f);
+}
+
+cv::Rect2f blend_track_box(const cv::Rect2f& previous, const cv::Rect& current)
+{
+    const float current_mix = 0.62f;
+    const float previous_mix = 1.0f - current_mix;
+    return cv::Rect2f(previous.x * previous_mix + static_cast<float>(current.x) * current_mix,
+                      previous.y * previous_mix + static_cast<float>(current.y) * current_mix,
+                      previous.width * previous_mix + static_cast<float>(current.width) * current_mix,
+                      previous.height * previous_mix + static_cast<float>(current.height) * current_mix);
+}
+
+void stabilize_tflite_detections(std::vector<PersonDetection>& detections, uint64_t sequence, const cv::Size& frame_size,
+                                 const Options& opt, float& best_confidence)
+{
+    static std::vector<StableTfliteTrack> tracks;
+
+    for (auto& track : tracks) {
+        ++track.misses;
+        track.confidence *= 0.91f;
+    }
+
+    std::vector<bool> claimed(tracks.size(), false);
+    for (const auto& detection : detections) {
+        int best_track = -1;
+        float best_score = 0.0f;
+        for (size_t i = 0; i < tracks.size(); ++i) {
+            if (claimed[i]) {
+                continue;
+            }
+
+            const float iou = stable_rect_iou(tracks[i].box, detection.box);
+            const cv::Point2f previous_center = stable_rect_center(tracks[i].box);
+            const cv::Point2f current_center = stable_rect_center(detection.box);
+            const float dx = previous_center.x - current_center.x;
+            const float dy = previous_center.y - current_center.y;
+            const float diagonal =
+                std::sqrt(tracks[i].box.width * tracks[i].box.width + tracks[i].box.height * tracks[i].box.height);
+            const float center_score =
+                clamp01(1.0f - std::sqrt(dx * dx + dy * dy) / std::max(32.0f, diagonal * 1.7f));
+            const float depth_delta = (tracks[i].mean_depth_mm > 0.0f && detection.mean_depth_mm > 0.0f)
+                                          ? std::abs(tracks[i].mean_depth_mm - detection.mean_depth_mm)
+                                          : 0.0f;
+            const float depth_penalty = clamp01(depth_delta / 1400.0f) * 0.12f;
+            const float match_score = std::max(iou, center_score) * 0.72f +
+                                      std::min(iou, center_score) * 0.28f - depth_penalty;
+            if (match_score > best_score) {
+                best_score = match_score;
+                best_track = static_cast<int>(i);
+            }
+        }
+
+        if (best_track >= 0 && best_score > 0.10f) {
+            auto& track = tracks[static_cast<size_t>(best_track)];
+            claimed[static_cast<size_t>(best_track)] = true;
+            track.box = blend_track_box(track.box, detection.box);
+            track.confidence = clamp01(track.confidence * 0.55f + detection.confidence * 0.45f + 0.035f);
+            track.mean_depth_mm =
+                detection.mean_depth_mm > 0.0f
+                    ? (track.mean_depth_mm > 0.0f ? track.mean_depth_mm * 0.35f + detection.mean_depth_mm * 0.65f
+                                                  : detection.mean_depth_mm)
+                    : track.mean_depth_mm;
+            track.hits += 1;
+            track.misses = 0;
+            track.last_sequence = sequence;
+        } else {
+            StableTfliteTrack track;
+            track.box = cv::Rect2f(detection.box);
+            track.confidence = clamp01(detection.confidence + 0.02f);
+            track.mean_depth_mm = detection.mean_depth_mm;
+            track.hits = 1;
+            track.misses = 0;
+            track.last_sequence = sequence;
+            tracks.push_back(track);
+            claimed.push_back(true);
+        }
+    }
+
+    std::vector<PersonDetection> stable;
+    const float immediate_floor = std::max(0.30f, opt.person_confidence);
+    const float confirmed_floor = std::max(0.22f, opt.person_confidence - 0.16f);
+    const cv::Rect bounds(0, 0, frame_size.width, frame_size.height);
+    for (const auto& track : tracks) {
+        const float held_confidence = clamp01(track.confidence * (1.0f - std::min(0.55f, track.misses * 0.08f)));
+        const bool strong_new_hit = track.misses == 0 && held_confidence >= immediate_floor;
+        const bool confirmed_track = track.hits >= 2 && track.misses <= 6 && held_confidence >= confirmed_floor;
+        if (!strong_new_hit && !confirmed_track) {
+            continue;
+        }
+
+        cv::Rect box = cv::Rect(track.box) & bounds;
+        if (box.area() <= 0) {
+            continue;
+        }
+
+        PersonDetection detection;
+        detection.box = box;
+        detection.confidence = held_confidence;
+        detection.mean_depth_mm = track.mean_depth_mm;
+        detection.valid = true;
+        stable.push_back(std::move(detection));
+        best_confidence = std::max(best_confidence, held_confidence);
+    }
+
+    tracks.erase(std::remove_if(tracks.begin(), tracks.end(), [](const StableTfliteTrack& track) {
+                     return track.misses > 9 || track.confidence < 0.10f;
+                 }),
+                 tracks.end());
+
+    std::sort(stable.begin(), stable.end(), [](const PersonDetection& lhs, const PersonDetection& rhs) {
+        if (lhs.confidence != rhs.confidence) {
+            return lhs.confidence > rhs.confidence;
+        }
+        if (lhs.mean_depth_mm > 0.0f && rhs.mean_depth_mm > 0.0f) {
+            return lhs.mean_depth_mm < rhs.mean_depth_mm;
+        }
+        return lhs.box.area() > rhs.box.area();
+    });
+    detections = std::move(stable);
+}
+
+} // namespace
+
 struct TFLitePersonDetector::Impl {
     std::unique_ptr<tflite::FlatBufferModel> model;
     std::unique_ptr<tflite::Interpreter> interpreter;
@@ -180,19 +370,10 @@ DetectionState TFLitePersonDetector::detect(const SharedFrame& frame, const Opti
     }
 
     // --- INPUT PREPROCESSING FOR TFLITE ---
-    // The ToF amplitude channel (infrared reflection intensity) is used as the
-    // model input. Use the same valid-depth-masked, percentile-normalized, CLAHE
-    // enhanced image shown by --show-detector-input instead of raw frame min/max;
-    // raw min/max is unstable when invalid pixels or hot reflectors dominate.
-    cv::Mat detector_bgr = build_amplitude_detector_input(frame, opt);
-    if (detector_bgr.empty()) {
-        cv::Mat fallback_gray = to_gray_preview(frame.depth_mm, opt);
-        if (!frame.confidence.empty()) {
-            cv::Mat valid = build_geometry_mask(frame.depth_mm, frame.confidence, opt);
-            fallback_gray.setTo(0, valid == 0);
-        }
-        cv::cvtColor(fallback_gray, detector_bgr, cv::COLOR_GRAY2BGR);
-    }
+    // Use a ToF composite by default: depth silhouette, amplitude texture, and
+    // confidence mask. It is more stable than raw amplitude when smoke/noise
+    // causes frame-wide haze.
+    cv::Mat detector_bgr = build_tflite_detector_input(frame, opt);
     if (detector_bgr.empty()) {
         return state;
     }
@@ -235,6 +416,7 @@ DetectionState TFLitePersonDetector::detect(const SharedFrame& frame, const Opti
     const int fw = frame.depth_mm.cols;
     const int fh = frame.depth_mm.rows;
     float best_confidence = 0.0f;
+    const float candidate_floor = std::max(0.20f, opt.person_confidence - 0.25f);
 
     const float person_class_id = static_cast<float>(opt.person_class_id);
     for (int i = 0; i < n; ++i) {
@@ -242,7 +424,8 @@ DetectionState TFLitePersonDetector::detect(const SharedFrame& frame, const Opti
             continue;
         }
         const float score = scores[i];
-        if (score < opt.person_confidence) {
+        best_confidence = std::max(best_confidence, score);
+        if (score < candidate_floor) {
             continue;
         }
 
@@ -282,18 +465,26 @@ DetectionState TFLitePersonDetector::detect(const SharedFrame& frame, const Opti
         det.mean_depth_mm = depth_mm;
         det.valid = true;
         state.people.push_back(det);
-        best_confidence = std::max(best_confidence, score);
     }
 
-    std::sort(state.people.begin(), state.people.end(),
-              [](const PersonDetection& a, const PersonDetection& b) { return a.confidence > b.confidence; });
+    stabilize_tflite_detections(state.people, frame.sequence, frame.depth_mm.size(), opt, best_confidence);
+
+    std::sort(state.people.begin(), state.people.end(), [](const PersonDetection& a, const PersonDetection& b) {
+        if (a.confidence != b.confidence) {
+            return a.confidence > b.confidence;
+        }
+        if (a.mean_depth_mm > 0.0f && b.mean_depth_mm > 0.0f) {
+            return a.mean_depth_mm < b.mean_depth_mm;
+        }
+        return a.box.area() > b.box.area();
+    });
     if (static_cast<int>(state.people.size()) > opt.max_people) {
         state.people.resize(static_cast<size_t>(opt.max_people));
     }
 
     state.valid = true;
     if (best_score_out) {
-        *best_score_out = best_confidence;
+        *best_score_out = state.people.empty() ? best_confidence : state.people.front().confidence;
     }
     return state;
 }

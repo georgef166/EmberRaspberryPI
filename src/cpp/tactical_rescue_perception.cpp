@@ -77,10 +77,10 @@ cv::Mat build_wireframe_overlay(const cv::Mat& depth_mm, const cv::Mat& confiden
     confidence.convertTo(confidence_u8, CV_8U, 255.0 / 1024.0);
     confidence_u8.setTo(0, geometry_mask == 0);
 
-    cv::Mat stable_mask = confidence >= static_cast<float>(std::min(255, opt.confidence_threshold + 12));
+    cv::Mat stable_mask = confidence >= static_cast<float>(opt.confidence_threshold + 28);
     stable_mask.convertTo(stable_mask, CV_8U, 255.0);
     cv::bitwise_and(stable_mask, geometry_mask, stable_mask);
-    stable_mask = remove_small_components(stable_mask, 24);
+    stable_mask = remove_small_components(stable_mask, 42);
     if (cv::countNonZero(stable_mask) >= 32) {
         geometry_mask = stable_mask;
         depth_gray.setTo(0, geometry_mask == 0);
@@ -92,11 +92,18 @@ cv::Mat build_wireframe_overlay(const cv::Mat& depth_mm, const cv::Mat& confiden
     cv::GaussianBlur(depth_smooth, depth_smooth, cv::Size(3, 3), 0.0);
     depth_smooth.setTo(0, geometry_mask == 0);
 
-    cv::applyColorMap(depth_smooth, overlay, cv::COLORMAP_TURBO);
+    cv::Mat blue;
+    cv::Mat green;
+    cv::Mat red;
+    depth_smooth.convertTo(blue, CV_8U, 0.20);
+    depth_smooth.convertTo(green, CV_8U, 0.78);
+    depth_smooth.convertTo(red, CV_8U, 0.30);
+    std::vector<cv::Mat> channels = {blue, green, red};
+    cv::merge(channels, overlay);
     overlay.setTo(cv::Scalar(0, 0, 0), geometry_mask == 0);
 
     cv::Mat brightness;
-    confidence_u8.convertTo(brightness, CV_32F, 0.35 / 255.0, 0.65);
+    confidence_u8.convertTo(brightness, CV_32F, 0.76 / 255.0, 0.18);
     for (int y = 0; y < overlay.rows; ++y) {
         cv::Vec3b* out_row = overlay.ptr<cv::Vec3b>(y);
         const float* gain_row = brightness.ptr<float>(y);
@@ -109,12 +116,13 @@ cv::Mat build_wireframe_overlay(const cv::Mat& depth_mm, const cv::Mat& confiden
     }
 
     cv::Mat edges;
-    cv::Canny(depth_smooth, edges, 42.0, 126.0, 3, true);
+    cv::Canny(depth_smooth, edges, 34.0, 112.0, 3, true);
     cv::bitwise_and(edges, geometry_mask, edges);
     cv::morphologyEx(edges, edges, cv::MORPH_OPEN, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(2, 2)));
     cv::morphologyEx(edges, edges, cv::MORPH_CLOSE, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3)));
     edges = remove_small_components(edges, 6);
-    overlay.setTo(cv::Scalar(255, 255, 255), edges > 0);
+    cv::dilate(edges, edges, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(2, 2)));
+    overlay.setTo(cv::Scalar(80, 255, 170), edges > 0);
 
     nearest_mm = 0.0f;
     double min_depth = 0.0;

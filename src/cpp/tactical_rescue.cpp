@@ -139,6 +139,20 @@ bool parse_args(int argc, char* argv[], Options& opt)
         std::exit(2);
     };
 
+    auto parse_tflite_input_mode = [](const std::string& value) {
+        if (value == "amplitude" || value == "amplitude-debug") {
+            return TfliteInputMode::AMPLITUDE;
+        }
+        if (value == "pseudo") {
+            return TfliteInputMode::PSEUDO;
+        }
+        if (value == "depth") {
+            return TfliteInputMode::DEPTH;
+        }
+        std::cerr << "Unknown TFLite input mode: " << value << std::endl;
+        std::exit(2);
+    };
+
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         auto require_value = [&](const char* name) -> const char* {
@@ -161,6 +175,7 @@ bool parse_args(int argc, char* argv[], Options& opt)
                 << "  --max-people NUM         Maximum rendered person detections\n"
                 << "  --detection-fps NUM      Detector cadence in frames per second\n"
                 << "  --detector-source MODE   auto | amplitude | confidence | pseudo | tflite | thermal\n"
+                << "  --tflite-input MODE      pseudo | depth | amplitude-debug (default pseudo, depth fallback)\n"
                 << "  --tflite-model PATH      Path to TFLite SSD person detection model\n"
                 << "  --edgetpu, --coral       Run TFLite inference on the Coral Edge TPU\n"
                 << "  --person-class NUM       Model output index for 'person' (default 1; Coral default 0)\n"
@@ -202,6 +217,8 @@ bool parse_args(int argc, char* argv[], Options& opt)
             opt.detection_fps_explicit = true;
         } else if (arg == "--detector-source") {
             opt.detector_source = parse_detector_source(require_value("--detector-source"));
+        } else if (arg == "--tflite-input") {
+            opt.tflite_input_mode = parse_tflite_input_mode(require_value("--tflite-input"));
         } else if (arg == "--tflite-model") {
             opt.tflite_model_path = require_value("--tflite-model");
             opt.tflite_model_explicit = true;
@@ -553,7 +570,28 @@ int main(int argc, char* argv[])
 
             if (options.show_detector_input) {
                 cv::Mat detector_input;
-                if (active_detector_source == DetectorSource::CONFIDENCE) {
+                if (active_detector_source == DetectorSource::TFLITE) {
+                    if (options.tflite_input_mode == TfliteInputMode::PSEUDO) {
+                        detector_input = build_pseudo_detector_input(lidar_input, options);
+                    } else if (options.tflite_input_mode == TfliteInputMode::DEPTH) {
+                        cv::Mat depth_gray = to_gray_preview(lidar_input.depth_mm, options);
+                        if (!lidar_input.confidence.empty()) {
+                            cv::Mat valid = build_geometry_mask(lidar_input.depth_mm, lidar_input.confidence, options);
+                            depth_gray.setTo(0, valid == 0);
+                        }
+                        cv::cvtColor(depth_gray, detector_input, cv::COLOR_GRAY2BGR);
+                    } else {
+                        detector_input = build_amplitude_detector_input(lidar_input, options);
+                    }
+                    if (detector_input.empty() && options.tflite_input_mode != TfliteInputMode::DEPTH) {
+                        cv::Mat depth_gray = to_gray_preview(lidar_input.depth_mm, options);
+                        if (!lidar_input.confidence.empty()) {
+                            cv::Mat valid = build_geometry_mask(lidar_input.depth_mm, lidar_input.confidence, options);
+                            depth_gray.setTo(0, valid == 0);
+                        }
+                        cv::cvtColor(depth_gray, detector_input, cv::COLOR_GRAY2BGR);
+                    }
+                } else if (active_detector_source == DetectorSource::CONFIDENCE) {
                     detector_input = build_confidence_detector_input(lidar_input, options);
                 } else if (active_detector_source == DetectorSource::PSEUDO) {
                     detector_input = build_pseudo_detector_input(lidar_input, options);
