@@ -6,11 +6,23 @@
 # Stale experiment folders
 example_cpp_extracted/
 
-# Nested project artifacts
-Ember/.git/
-Ember/.git_backup/
-Ember/build/
-Ember/venv/
-Ember/**/venv/
-Ember/**/__pycache__/
-Ember/**/*.zip
+# Python virtualenvs and cache
+venv/
+**/venv/
+**/__pycache__/
+*.pyc
+py_arducam/
+
+# Build artifacts
+CMakeFiles/
+build/
+
+# Local git backup / downloads
+.git_backup/
+*.zip
+*.patch
+
+# Local config / calibration
+/src/python/*.json
+/*.json
+/cali.bin
