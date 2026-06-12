@@ -157,6 +157,8 @@ bool parse_args(int argc, char* argv[], Options& opt)
                 << "  --detection-fps NUM      Detector cadence in frames per second\n"
                 << "  --detector-source MODE   auto | amplitude | confidence | pseudo | tflite\n"
                 << "  --tflite-model PATH      Path to TFLite SSD person detection model\n"
+                << "  --edgetpu                Run TFLite inference on the Coral Edge TPU\n"
+                << "  --person-class NUM       Model output index for 'person' (default 1; use 0 for Coral v2 COCO)\n"
                 << "  --am2302-gpio NUM        BCM GPIO used for AM2302 data (default 4)\n"
                 << "  --no-am2302              Disable AM2302 ambient overlay\n"
                 << "  --hud-scale NUM          HUD scale factor\n"
@@ -184,6 +186,10 @@ bool parse_args(int argc, char* argv[], Options& opt)
             opt.detector_source = parse_detector_source(require_value("--detector-source"));
         } else if (arg == "--tflite-model") {
             opt.tflite_model_path = require_value("--tflite-model");
+        } else if (arg == "--edgetpu") {
+            opt.edgetpu = true;
+        } else if (arg == "--person-class") {
+            opt.person_class_id = std::max(0, std::atoi(require_value("--person-class")));
         } else if (arg == "--am2302-gpio") {
             opt.am2302_gpio = std::max(0, std::atoi(require_value("--am2302-gpio")));
         } else if (arg == "--no-am2302") {
@@ -249,7 +255,7 @@ int main(int argc, char* argv[])
     // See tactical_rescue_tflite.cpp for the full inference pipeline.
     TFLitePersonDetector tflite_detector;
     const bool tflite_available = file_exists(options.tflite_model_path) &&
-                                  tflite_detector.load(options.tflite_model_path);
+                                  tflite_detector.load(options.tflite_model_path, options.edgetpu);
 
     DetectorSource active_detector_source = DetectorSource::CONFIDENCE;
     if (options.detector_source == DetectorSource::TFLITE) {
@@ -266,7 +272,9 @@ int main(int argc, char* argv[])
     }
 
     if (active_detector_source == DetectorSource::TFLITE) {
-        std::cout << "Detector: TensorFlow Lite SSD person detection" << std::endl;
+        std::cout << "Detector: TensorFlow Lite SSD person detection on "
+                  << (tflite_detector.uses_edgetpu() ? "Coral Edge TPU" : "Raspberry Pi CPU")
+                  << std::endl;
     } else if (active_detector_source == DetectorSource::CONFIDENCE) {
         std::cout << "Detector input using ToF confidence heuristic" << std::endl;
     } else if (active_detector_source == DetectorSource::PSEUDO) {

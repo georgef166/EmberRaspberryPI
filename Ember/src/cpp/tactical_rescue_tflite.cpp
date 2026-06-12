@@ -3,13 +3,18 @@
 //
 // This file implements real-time on-device person detection using Google's
 // TensorFlow Lite inference engine. No network or cloud connection is required —
-// inference runs entirely on the Raspberry Pi 4B CPU, which is critical for
-// deployment inside active structure fires where radio and network access
-// are unavailable.
+// inference runs entirely on-device, which is critical for deployment inside
+// active structure fires where radio and network access are unavailable.
 //
-// Model: MobileNet SSD v1 COCO quantized (models/detect.tflite, ~4MB)
-//   - Source: Google TFLite Model Zoo
-//   - Input:  [1, 300, 300, 3] uint8 RGB
+// Backends (selected at load() time):
+//   - CPU:       all 4 Raspberry Pi 4B ARM cores via the built-in op resolver.
+//   - Coral TPU: Google Edge TPU via libedgetpu (--edgetpu, EMBER_HAVE_EDGETPU).
+//                Offloads inference to the attached Coral, freeing the CPU for
+//                ToF rendering and enabling a larger/faster model.
+//
+// Model: SSD MobileNet (COCO, quantized uint8) — v1 on CPU, v2 _edgetpu on Coral
+//   - Source: Google TFLite Model Zoo / Coral model garden
+//   - Input:  [1, H, W, 3] uint8 RGB (H/W read dynamically from the model)
 //   - Output: detection_boxes, detection_classes, detection_scores, num_detections
 //
 // Pipeline:
@@ -37,24 +42,43 @@
 #include "tensorflow/lite/kernels/register.h"
 #include "tensorflow/lite/model.h"
 
+// =============================================================================
+// GOOGLE CORAL EDGE TPU (libedgetpu)
+//
+// When the binary is built with EMBER_HAVE_EDGETPU (set by CMake when libedgetpu
+// is found) and run with --edgetpu, the same SSD person-detection model — compiled
+// for the Edge TPU — runs on the attached Coral instead of the Pi's ARM cores.
+// This frees all 4 CPU cores for ToF rendering and pushes inference to ~70+ FPS,
+// leaving headroom for a larger/more accurate detector (e.g. SSD MobileNet v2).
+// =============================================================================
+#ifdef EMBER_HAVE_EDGETPU
+#include "edgetpu.h"
+#endif
+
 namespace tactical_rescue {
 
-static constexpr int kModelInputSize = 300;   // MobileNet SSD expects 300x300 input
-static constexpr int kMaxDetections = 10;     // SSD model outputs up to 10 detections
-static constexpr float kPersonClassId = 1.0f; // COCO label index: 0=background, 1=person
+static constexpr int kModelInputSize = 300; // MobileNet SSD expects 300x300 input
+static constexpr int kMaxDetections = 10;   // SSD model outputs up to 10 detections
+// COCO "person" output index is model-dependent (1 for the bundled 91-class
+// model, 0 for the Coral v2 COCO model) — supplied at runtime via opt.person_class_id.
 
 struct TFLitePersonDetector::Impl {
     std::unique_ptr<tflite::FlatBufferModel> model;
     std::unique_ptr<tflite::Interpreter> interpreter;
     bool loaded = false;
+    bool on_edgetpu = false;
     int input_w = kModelInputSize;
     int input_h = kModelInputSize;
+#ifdef EMBER_HAVE_EDGETPU
+    // Keep the Coral device context alive for the lifetime of the interpreter.
+    std::shared_ptr<edgetpu::EdgeTpuContext> edgetpu_context;
+#endif
 };
 
 TFLitePersonDetector::TFLitePersonDetector() : impl_(std::make_unique<Impl>()) {}
 TFLitePersonDetector::~TFLitePersonDetector() = default;
 
-bool TFLitePersonDetector::load(const std::string& model_path)
+bool TFLitePersonDetector::load(const std::string& model_path, bool use_edgetpu)
 {
     // [TFLite] Load flatbuffer model from disk into memory
     impl_->model = tflite::FlatBufferModel::BuildFromFile(model_path.c_str());
@@ -63,15 +87,51 @@ bool TFLitePersonDetector::load(const std::string& model_path)
         return false;
     }
 
-    // [TFLite] Register built-in ops (Conv2D, DepthwiseConv, etc.) and build interpreter
+    // [TFLite] Register built-in ops (Conv2D, DepthwiseConv, etc.).
     tflite::ops::builtin::BuiltinOpResolver resolver;
+
+#ifdef EMBER_HAVE_EDGETPU
+    // [Coral] Open the Edge TPU device and register its custom op so the
+    // interpreter can dispatch the edgetpu-custom-op subgraph to the Coral.
+    if (use_edgetpu) {
+        impl_->edgetpu_context = edgetpu::EdgeTpuManager::GetSingleton()->OpenDevice();
+        if (!impl_->edgetpu_context) {
+            std::cerr << "[Coral] No Edge TPU device found — falling back to CPU inference."
+                      << std::endl;
+            use_edgetpu = false;
+        } else {
+            resolver.AddCustom(edgetpu::kCustomOp, edgetpu::RegisterCustomOp());
+        }
+    }
+#else
+    if (use_edgetpu) {
+        std::cerr << "[Coral] Binary built without Edge TPU support (libedgetpu not found at "
+                     "build time) — falling back to CPU inference."
+                  << std::endl;
+        use_edgetpu = false;
+    }
+#endif
+
     tflite::InterpreterBuilder builder(*impl_->model, resolver);
     if (builder(&impl_->interpreter) != kTfLiteOk) {
         std::cerr << "[TFLite] Failed to build interpreter" << std::endl;
         return false;
     }
 
-    impl_->interpreter->SetNumThreads(4); // Use all 4 cores of Raspberry Pi 4B
+#ifdef EMBER_HAVE_EDGETPU
+    if (use_edgetpu) {
+        // [Coral] Bind the interpreter to the opened Edge TPU context. With the TPU
+        // doing the heavy lifting, a single host thread is optimal (more just adds
+        // dispatch contention).
+        impl_->interpreter->SetExternalContext(kTfLiteEdgeTpuContext, impl_->edgetpu_context.get());
+        impl_->interpreter->SetNumThreads(1);
+        impl_->on_edgetpu = true;
+    } else
+#endif
+    {
+        impl_->interpreter->SetNumThreads(4); // Use all 4 cores of Raspberry Pi 4B
+    }
+
     // [TFLite] Allocate memory for all input/output tensors
     if (impl_->interpreter->AllocateTensors() != kTfLiteOk) {
         std::cerr << "[TFLite] Failed to allocate tensors" << std::endl;
@@ -88,8 +148,14 @@ bool TFLitePersonDetector::load(const std::string& model_path)
 
     impl_->loaded = true;
     std::cout << "[TFLite] Model loaded: " << model_path
-              << " input=" << impl_->input_w << "x" << impl_->input_h << std::endl;
+              << " input=" << impl_->input_w << "x" << impl_->input_h
+              << " backend=" << (impl_->on_edgetpu ? "Coral Edge TPU" : "CPU") << std::endl;
     return true;
+}
+
+bool TFLitePersonDetector::uses_edgetpu() const
+{
+    return impl_->on_edgetpu;
 }
 
 bool TFLitePersonDetector::is_loaded() const
@@ -158,8 +224,9 @@ DetectionState TFLitePersonDetector::detect(const SharedFrame& frame, const Opti
     const int fh = frame.depth_mm.rows;
     float best_confidence = 0.0f;
 
+    const float person_class_id = static_cast<float>(opt.person_class_id);
     for (int i = 0; i < n; ++i) {
-        if (std::abs(classes[i] - kPersonClassId) > 0.5f) {
+        if (std::abs(classes[i] - person_class_id) > 0.5f) {
             continue;
         }
         const float score = scores[i];

@@ -22,12 +22,14 @@ Ember replaces this handheld heat-map with an individual, hands-free spatial awa
 
 ## Google Technology
 
-**TensorFlow Lite** (tensorflow/lite C++ API v2.20) — runs Google's MobileNet SSD v1 COCO quantized person-detection model fully on-device on the Raspberry Pi 4B CPU. No network required, which is critical for deployment inside active structure fires where radio and network access are unavailable.
+**TensorFlow Lite** (tensorflow/lite C++ API v2.20) — runs Google's MobileNet SSD COCO quantized person-detection model fully on-device. No network required, which is critical for deployment inside active structure fires where radio and network access are unavailable.
 
-- Model file: `Ember/models/detect.tflite` (~4 MB)
+- Model file: `Ember/models/detect.tflite` (~4 MB, MobileNet SSD v1)
 - Inference cadence: 8 FPS on the Pi's 4 ARM Cortex-A72 cores
 - Input: ToF amplitude channel (infrared reflection intensity) normalized to 300×300 uint8 RGB
 - Output: depth-validated person bounding boxes, rendered into the tactical HUD
+
+**Google Coral Edge TPU** (`libedgetpu`, optional) — when a Coral is attached, the `--edgetpu` backend offloads inference to the Edge TPU, freeing all 4 CPU cores for ToF rendering and running a heavier model (SSD MobileNet **v2** COCO) at ~70+ FPS. Setup via `Ember/Install_coral.sh`; the build auto-detects the Coral and falls back to CPU-only when absent.
 
 ---
 
@@ -37,8 +39,13 @@ Ember replaces this handheld heat-map with an individual, hands-free spatial awa
 cd Ember
 ./Install_dependencies.sh
 sudo apt-get install -y libtensorflow-lite-dev
+./Install_coral.sh          # optional — only if a Google Coral is attached
 ./compile.sh
 QT_QPA_PLATFORM=xcb ./build/src/cpp/tactical_rescue
+
+# With Coral Edge TPU:
+QT_QPA_PLATFORM=xcb ./build/src/cpp/tactical_rescue \
+    --edgetpu --tflite-model models/ssd_mobilenet_v2_coco_edgetpu.tflite --person-class 0
 ```
 
 A desktop launcher (`TacticalRescue.desktop`) is also provided for one-click operation.
@@ -61,9 +68,10 @@ EmberPI/
 │   ├── src/python/
 │   │   └── am2302_stream.py        Temp/humidity sensor helper
 │   ├── models/
-│   │   ├── detect.tflite           Google MobileNet SSD v1 COCO
+│   │   ├── detect.tflite           Google MobileNet SSD v1 COCO (CPU)
 │   │   └── labelmap.txt            COCO class labels
 │   ├── compile.sh                  Build script
+│   ├── Install_coral.sh            Coral Edge TPU runtime + v2 model setup
 │   └── README.md                   Full technical documentation
 ├── TacticalRescue.desktop          One-click desktop launcher
 └── README.md                       This file
@@ -77,6 +85,7 @@ EmberPI/
 |---|---|
 | Raspberry Pi 4B | 4 GB RAM |
 | Arducam ToF Camera | 240×180 native, CSI or USB, up to 4 m range |
+| Google Coral *(optional)* | Edge TPU accelerator (USB / M.2) — `--edgetpu` backend |
 | AM2302 sensor *(optional)* | Temperature / humidity overlay |
 | Display | Any HDMI output or helmet-mounted HMD |
 

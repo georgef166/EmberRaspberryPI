@@ -13,11 +13,19 @@ In structural firefighting, smoke routinely drops visibility below 15cm, renderi
 ## Google Technology
 
 **TensorFlow Lite** (TFLite) — `tensorflow/lite` C++ API v2.20  
-- Model: MobileNet SSD v1 COCO quantized (`models/detect.tflite`, 4MB)
+- Model: MobileNet SSD COCO quantized — v1 on CPU (`models/detect.tflite`, 4MB)
 - Runs fully on-device — no network required in the field
 - Processes the ToF amplitude channel (normalized grayscale → 300×300 RGB) at the configured detection FPS
 - Detected person bounding boxes are depth-validated against the live depth frame before rendering
 - Falls back to classical ToF heuristics if no model file is present
+
+**Google Coral Edge TPU** (`libedgetpu`) — optional hardware acceleration  
+- With a Coral attached, the `--edgetpu` backend offloads the same SSD inference to the Edge TPU instead of the Pi's ARM cores
+- Frees all 4 CPU cores for ToF rendering and pushes inference to ~70+ FPS, leaving headroom for a larger model (SSD MobileNet **v2** COCO, `models/ssd_mobilenet_v2_coco_edgetpu.tflite`)
+- Requires an Edge TPU-compiled model; the CMake build auto-detects `libedgetpu` and enables the backend (`EMBER_HAVE_EDGETPU`). Without the Coral, the binary still builds and runs CPU-only
+- Setup: `./Install_coral.sh` (installs runtime + dev headers, downloads the v2 model)
+
+> **Note on detection quality:** the Coral accelerates inference and enables a heavier model, but it does not close the domain gap — the COCO model is trained on visible-light RGB while the input is the ToF amplitude (mono IR) channel. The largest accuracy gains will come from fine-tuning a detector on real ToF data, which the Coral can then run at high frame rates.
 
 ---
 
@@ -41,6 +49,16 @@ Install all dependencies (run from repo root on Raspberry Pi):
 sudo apt-get install -y libtensorflow-lite-dev
 ```
 
+### Optional: Google Coral Edge TPU
+
+If a Coral (USB Accelerator or M.2/PCIe) is attached, install the Edge TPU runtime, C++ headers, and the v2 model:
+
+```bash
+./Install_coral.sh
+```
+
+The next `cmake` configure will print `Coral Edge TPU support: ENABLED` and build the `--edgetpu` backend.
+
 ---
 
 ## Build
@@ -56,7 +74,14 @@ make tactical_rescue
 ## Run
 
 ```bash
+# CPU (default) — bundled MobileNet SSD v1
 QT_QPA_PLATFORM=xcb ./build/src/cpp/tactical_rescue
+
+# Coral Edge TPU — SSD MobileNet v2 (note --person-class 0 for the v2 COCO labelmap)
+QT_QPA_PLATFORM=xcb ./build/src/cpp/tactical_rescue \
+    --edgetpu \
+    --tflite-model models/ssd_mobilenet_v2_coco_edgetpu.tflite \
+    --person-class 0
 ```
 
 The `QT_QPA_PLATFORM=xcb` flag forces the X11 display backend — required on Raspberry Pi OS with Wayland enabled.
@@ -77,6 +102,8 @@ A one-click launcher is provided at `TacticalRescue.desktop` on the Desktop. Dou
 ```
 --detector-source MODE    auto | amplitude | confidence | pseudo | tflite
 --tflite-model PATH       Path to TFLite model (default: models/detect.tflite)
+--edgetpu                 Run TFLite inference on the Coral Edge TPU
+--person-class NUM        Model output index for 'person' (default 1; use 0 for Coral v2 COCO)
 --range MM                ToF range in mm (default: 4000)
 --min-depth MM            Ignore geometry closer than this (default: 200)
 --max-depth MM            Ignore geometry farther than this

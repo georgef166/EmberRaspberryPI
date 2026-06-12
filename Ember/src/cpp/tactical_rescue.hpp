@@ -43,6 +43,11 @@ struct Options {
     bool show_detector_input = false;
     bool enable_am2302 = true;
     DetectorSource detector_source = DetectorSource::AUTO;
+    bool edgetpu = false; // Run TFLite inference on the Coral Edge TPU instead of the Pi CPU
+    // COCO "person" output index. The bundled 91-class detect.tflite uses 1
+    // (index 0 = background "???"). The Coral ssd_mobilenet_v2_coco model uses
+    // a 90-class 0-indexed labelmap where person = 0 — pass --person-class 0.
+    int person_class_id = 1;
     std::string am2302_helper_path = kDefaultAm2302HelperPath;
     std::string tflite_model_path = "/home/admin/Desktop/Ember/models/detect.tflite";
 };
