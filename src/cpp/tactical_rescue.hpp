@@ -26,7 +26,14 @@ enum class DetectorSource {
     CONFIDENCE,
     PSEUDO,
     TFLITE,
+    THERMAL,
 };
+
+// MLX90640-D55 far-infrared thermal array (32x24, I2C).
+constexpr int kThermalWidth = 32;
+constexpr int kThermalHeight = 24;
+constexpr int kDefaultThermalAddress = 0x33;
+constexpr int kDefaultThermalRefreshHz = 8;
 
 struct Options {
     int device = 0;
@@ -48,6 +55,15 @@ struct Options {
     // (index 0 = background "???"). The Coral ssd_mobilenet_v2_coco model uses
     // a 90-class 0-indexed labelmap where person = 0 — pass --person-class 0.
     int person_class_id = 1;
+    // --- MLX90640 thermal imaging ---
+    bool enable_thermal = true;        // Read the MLX90640 and render the thermal overlay
+    int thermal_address = kDefaultThermalAddress;
+    int thermal_refresh_hz = kDefaultThermalRefreshHz;
+    float thermal_emissivity = 0.95f;  // Skin/fabric ~0.95; tune per surface
+    float fire_temp_c = 60.0f;         // Hotspot/fire warning threshold
+    float victim_temp_min_c = 26.0f;   // Warm-body band: lower bound (people through smoke)
+    float victim_temp_max_c = 45.0f;   // Warm-body band: upper bound (above => fire, not a person)
+    float thermal_overlay_alpha = 0.45f;
     std::string am2302_helper_path = kDefaultAm2302HelperPath;
     std::string tflite_model_path = "/home/admin/Desktop/Ember/models/detect.tflite";
 };
@@ -78,6 +94,19 @@ struct SharedFrame {
     cv::Mat amplitude;
     uint64_t sequence = 0;
     std::chrono::steady_clock::time_point captured_at;
+};
+
+// One MLX90640 readout: a 32x24 grid of per-pixel temperatures in degrees C,
+// plus derived scene statistics used by the detector, overlay, and HUD.
+struct ThermalFrame {
+    cv::Mat temperature_c;          // kThermalHeight x kThermalWidth, CV_32F (deg C)
+    float min_c = 0.0f;
+    float max_c = 0.0f;
+    float mean_c = 0.0f;
+    cv::Point hotspot{-1, -1};      // pixel of peak temperature in 32x24 space
+    uint64_t sequence = 0;
+    bool valid = false;
+    std::chrono::steady_clock::time_point captured_at{};
 };
 
 struct PersonDetection {
@@ -113,6 +142,16 @@ struct RuntimeStats {
     std::chrono::steady_clock::time_point ambient_updated_at{};
     std::string ambient_status = "OFF";
     std::string detector_source_label = "OFF";
+    // --- MLX90640 thermal ---
+    bool thermal_enabled = false;
+    bool thermal_valid = false;
+    float thermal_max_c = 0.0f;
+    float thermal_min_c = 0.0f;
+    float thermal_mean_c = 0.0f;
+    bool fire_warning = false;
+    double thermal_age_s = 0.0;
+    std::chrono::steady_clock::time_point thermal_updated_at{};
+    std::string thermal_status = "OFF";
 };
 
 class FpsCounter {
@@ -158,6 +197,7 @@ DetectionState run_tof_person_detector(const SharedFrame& lidar_frame, DetectorS
                                        float* best_person_score_out = nullptr);
 
 void draw_person_detection(cv::Mat& frame, const PersonDetection& detection, int index);
+void draw_thermal_overlay(cv::Mat& frame, const ThermalFrame& thermal, const Options& opt);
 void draw_hud(cv::Mat& frame, const RuntimeStats& stats, const DetectionState& detections, bool detector_enabled,
               int scale);
 cv::Mat compose_display_canvas(const cv::Mat& source);

@@ -31,7 +31,25 @@ Ember replaces this handheld heat-map with an individual, hands-free spatial awa
 
 **Google Coral Edge TPU** (`libedgetpu`, optional) — when a Coral is attached, the `--edgetpu` backend offloads inference to the Edge TPU, freeing all 4 CPU cores for ToF rendering and running a heavier model (SSD MobileNet **v2** COCO) at ~70+ FPS. Setup via `./Install_coral.sh`; the build auto-detects the Coral and falls back to CPU-only when absent.
 
-> **Note on detection quality:** the Coral accelerates inference and enables a heavier model, but it does not close the domain gap — the COCO model is trained on visible-light RGB while the input is the ToF amplitude (mono IR) channel. The largest accuracy gains will come from fine-tuning a detector on real ToF data, which the Coral can then run at high frame rates.
+> **Note on detection quality:** the Coral accelerates inference and enables a heavier model, but it does not close the domain gap — the COCO model is trained on visible-light RGB while the input is the ToF amplitude (mono IR) channel. The largest accuracy gains will come from fine-tuning a detector on real ToF data, which the Coral can then run at high frame rates. The MLX90640 thermal channel (below) sidesteps this gap entirely.
+
+---
+
+## Thermal Imaging — MLX90640 (optional)
+
+The **MLX90640-D55** is a 32×24 far-infrared thermal array (I²C, ~8 Hz). Unlike the mono-IR ToF amplitude channel, it reports a true **per-pixel temperature**, so a human reads as a warm blob against smoke-cooled surroundings — the most reliable victim cue in heavy smoke — and active fire reads as a saturated hotspot. This directly addresses the visible-light/RGB detection blocker the project hit with COCO models.
+
+When the sensor is present (`./Install_thermal.sh` builds the [Melexis driver](https://github.com/melexis/mlx90640-library) and the build defines `EMBER_HAVE_MLX90640`), Ember adds:
+
+- **Thermal heat-map overlay** — warm regions colorized over the ToF wireframe (cold structure stays as geometry).
+- **Fire / hotspot warning** — a HUD banner + max-scene-temperature panel when any pixel exceeds `--fire-temp` (default 60 °C).
+- **Warm-body victim detector** (`--detector-source thermal`) — thermal blobs in the configured human temperature band, mapped into ToF image space and depth-validated. Selectable, and the AUTO fallback when no TFLite model is loaded.
+
+The overlay and fire warning are always on when the sensor is present, regardless of which person detector is active, so the Coral/TFLite path and the thermal channel complement each other.
+
+> **Calibration caveat:** the thermal↔ToF mapping currently assumes the two fields of view are roughly co-aligned and centered (simple proportional scaling). For accurate fused boxes in the field, a measured homography between the MLX90640 (55° FOV) and the Arducam ToF is required — this is the next calibration step.
+
+Wiring: `VIN→3V3`, `GND→GND`, `SDA→GPIO2 (pin 3)`, `SCL→GPIO3 (pin 5)`. Default I²C address `0x33`.
 
 ---
 
@@ -41,6 +59,7 @@ Ember replaces this handheld heat-map with an individual, hands-free spatial awa
 |---|---|
 | Raspberry Pi 4B | 4 GB RAM |
 | Arducam ToF Camera | 240×180 native, CSI or USB, up to 4 m range |
+| MLX90640-D55 *(optional)* | 32×24 thermal IR array, I²C — heat overlay, fire warning, warm-body victim detection |
 | Google Coral *(optional)* | Edge TPU accelerator (USB / M.2) — `--edgetpu` backend |
 | AM2302 sensor *(optional)* | Temperature / humidity overlay |
 | Display | Any HDMI output or helmet-mounted HMD |
@@ -55,14 +74,18 @@ Total bill of materials: **under $150** versus $5,000–$15,000 for a commercial
 ./Install_dependencies.sh
 sudo apt-get install -y libtensorflow-lite-dev
 ./Install_coral.sh          # optional — only if a Google Coral is attached
+./Install_thermal.sh        # optional — only if the MLX90640 thermal camera is attached
 ./compile.sh
 
-# CPU (default) — bundled MobileNet SSD v1
+# CPU (default) — bundled MobileNet SSD v1 (thermal overlay/fire warning auto-on if present)
 QT_QPA_PLATFORM=xcb ./build/src/cpp/tactical_rescue
 
 # Coral Edge TPU — SSD MobileNet v2 (note --person-class 0 for the v2 COCO labelmap)
 QT_QPA_PLATFORM=xcb ./build/src/cpp/tactical_rescue \
     --edgetpu --tflite-model models/ssd_mobilenet_v2_coco_edgetpu.tflite --person-class 0
+
+# Thermal-primary victim detection (MLX90640)
+QT_QPA_PLATFORM=xcb ./build/src/cpp/tactical_rescue --detector-source thermal
 ```
 
 The `QT_QPA_PLATFORM=xcb` flag forces the X11 display backend — required on Raspberry Pi OS with Wayland enabled.
@@ -91,10 +114,17 @@ The CMake configure step prints `Coral Edge TPU support: ENABLED` when `libedget
 ## CLI Options
 
 ```
---detector-source MODE    auto | amplitude | confidence | pseudo | tflite
+--detector-source MODE    auto | amplitude | confidence | pseudo | tflite | thermal
 --tflite-model PATH        Path to TFLite model (default: models/detect.tflite)
 --edgetpu                  Run TFLite inference on the Coral Edge TPU
 --person-class NUM         Model output index for 'person' (default 1; use 0 for Coral v2 COCO)
+--no-thermal               Disable the MLX90640 thermal overlay/detector
+--thermal-address HEX      MLX90640 I²C address (default 0x33)
+--thermal-refresh HZ       MLX90640 refresh rate: 1|2|4|8|16|32|64 (default 8)
+--emissivity FLOAT         Thermal emissivity (default 0.95)
+--fire-temp C              Hotspot/fire warning threshold in °C (default 60)
+--victim-temp-min C        Warm-body band lower bound in °C (default 26)
+--victim-temp-max C        Warm-body band upper bound in °C (default 45)
 --range MM                 ToF range in mm (default: 4000)
 --min-depth MM             Ignore geometry closer than this (default: 200)
 --max-depth MM             Ignore geometry farther than this
@@ -127,10 +157,11 @@ The CMake configure step prints `Coral Edge TPU support: ENABLED` when `libedget
 │  │              │   │ fallback         │   │         │  │
 │  └──────────────┘   └──────────────────┘   └─────────┘  │
 │                                                         │
-│  ┌──────────────┐                                       │
-│  │ AM2302       │  Temperature/humidity overlay         │
-│  │ Thread       │  (optional, via Python subprocess)    │
-│  └──────────────┘                                       │
+│  ┌──────────────┐   ┌──────────────────┐               │
+│  │ AM2302       │   │ MLX90640 Thermal │  Heat overlay, │
+│  │ Thread       │   │ Thread (I²C)     │  fire warning, │
+│  │ temp/humidity│   │ 32×24 °C grid    │  warm-body det.│
+│  └──────────────┘   └──────────────────┘               │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -142,7 +173,8 @@ The CMake configure step prints `Coral Edge TPU support: ENABLED` when `libedget
 | `src/cpp/tactical_rescue_capture.cpp` | ToF camera acquisition thread |
 | `src/cpp/tactical_rescue_perception.cpp` | Classical CV detector (depth/amplitude/confidence heuristics) |
 | `src/cpp/tactical_rescue_tflite.cpp` | **TensorFlow Lite** person detection (CPU + Coral Edge TPU) |
-| `src/cpp/tactical_rescue_render.cpp` | Wireframe overlay composition and HUD rendering |
+| `src/cpp/tactical_rescue_thermal.cpp` | **MLX90640** thermal capture + warm-body victim detector |
+| `src/cpp/tactical_rescue_render.cpp` | Wireframe overlay, thermal overlay, HUD, fire warning |
 | `models/detect.tflite` | MobileNet SSD v1 COCO quantized model (Google TFLite Model Zoo) |
 
 ---
@@ -157,7 +189,15 @@ The CMake configure step prints `Coral Edge TPU support: ENABLED` when `libedget
 6. Each box depth-validated against the live `depth_mm` frame
 7. Passed to temporal stabilizer → renderer
 
-In `AUTO` mode, TFLite activates automatically when the model file is present. When absent, the system falls back to the classical ToF geometry heuristic.
+In `AUTO` mode, TFLite activates automatically when the model file is present; otherwise the **thermal** warm-body detector is used when the MLX90640 is present, falling back to the classical ToF geometry heuristic.
+
+## Detection Pipeline (Thermal)
+
+1. MLX90640 chess-mode subpages → 32×24 per-pixel temperature grid (°C)
+2. Threshold the warm-body band (`--victim-temp-min`…`--victim-temp-max`, rejecting fire/hot surfaces)
+3. Connected-component blobs → confidence from contrast above the scene mean + size
+4. Each blob mapped into ToF image space and depth-validated against the live `depth_mm` frame
+5. Boxes passed to the renderer; max scene temperature drives the fire/hotspot warning
 
 ---
 
@@ -166,11 +206,12 @@ In `AUTO` mode, TFLite activates automatically when the model file is present. W
 ```
 EmberRaspberryPI/
 ├── src/cpp/                       Source + reference demos
-│   ├── tactical_rescue.cpp        Main orchestrator, 3-thread pipeline
+│   ├── tactical_rescue.cpp        Main orchestrator, multi-thread pipeline
 │   ├── tactical_rescue_tflite.cpp Google TensorFlow Lite / Coral inference
-│   ├── tactical_rescue_capture.cpp    ToF camera acquisition
+│   ├── tactical_rescue_thermal.cpp   MLX90640 thermal capture + warm-body detector
+│   ├── tactical_rescue_capture.cpp   ToF camera acquisition
 │   ├── tactical_rescue_perception.cpp Classical CV fallback
-│   └── tactical_rescue_render.cpp HUD and wireframe rendering
+│   └── tactical_rescue_render.cpp HUD, wireframe + thermal overlay
 ├── src/python/
 │   └── am2302_stream.py           Temp/humidity sensor helper
 ├── models/
@@ -180,6 +221,7 @@ EmberRaspberryPI/
 ├── compile.sh                     Build script
 ├── Install_dependencies.sh        ToF SDK + OpenCV + TFLite setup
 ├── Install_coral.sh               Coral Edge TPU runtime + v2 model setup
+├── Install_thermal.sh             MLX90640 driver build + I²C enablement
 ├── TacticalRescue.desktop         One-click desktop launcher
 └── README.md                      This file
 ```

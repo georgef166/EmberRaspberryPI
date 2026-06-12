@@ -263,6 +263,39 @@ void draw_person_detection(cv::Mat& frame, const PersonDetection& detection, int
     cv::line(frame, cv::Point(center_x, center_y - 4), cv::Point(center_x, center_y + 4), color, 1, cv::LINE_AA);
 }
 
+void draw_thermal_overlay(cv::Mat& frame, const ThermalFrame& thermal, const Options& opt)
+{
+    if (!thermal.valid || thermal.temperature_c.empty() || frame.empty()) {
+        return;
+    }
+
+    // Map temperature to a fixed [warm-body floor, fire threshold] display range
+    // so the colours stay stable frame-to-frame. Cold structure (below the floor)
+    // is left untinted so the wireframe geometry still reads through.
+    const float lo = opt.victim_temp_min_c;
+    const float hi = std::max(opt.fire_temp_c, lo + 1.0f);
+    const float scale = 1.0f / (hi - lo);
+
+    cv::Mat norm;
+    thermal.temperature_c.convertTo(norm, CV_32F, scale, -lo * scale);
+    cv::threshold(norm, norm, 1.0, 1.0, cv::THRESH_TRUNC);  // clamp high
+    cv::threshold(norm, norm, 0.0, 0.0, cv::THRESH_TOZERO); // clamp low
+    cv::Mat norm8;
+    norm.convertTo(norm8, CV_8U, 255.0);
+
+    cv::Mat heat_small;
+    cv::applyColorMap(norm8, heat_small, cv::COLORMAP_INFERNO);
+    const cv::Mat warm_small = norm8 > 0; // only tint above the warm-body floor
+
+    cv::Mat heat, mask;
+    cv::resize(heat_small, heat, frame.size(), 0, 0, cv::INTER_LINEAR);
+    cv::resize(warm_small, mask, frame.size(), 0, 0, cv::INTER_NEAREST);
+
+    cv::Mat blended;
+    cv::addWeighted(heat, opt.thermal_overlay_alpha, frame, 1.0 - opt.thermal_overlay_alpha, 0.0, blended);
+    blended.copyTo(frame, mask);
+}
+
 void draw_hud(cv::Mat& frame, const RuntimeStats& stats, const DetectionState& detections, bool detector_enabled,
               int scale)
 {
@@ -341,6 +374,58 @@ void draw_hud(cv::Mat& frame, const RuntimeStats& stats, const DetectionState& d
                         cv::Point(ambient_rect.x + static_cast<int>(18 * ui), ambient_rect.y + static_cast<int>(106 * ui)),
                         cv::FONT_HERSHEY_SIMPLEX, 0.46 * ui, text_color, 1, cv::LINE_AA);
         }
+    }
+
+    // --- MLX90640 thermal readout (top-right, below the ambient panel) ---
+    if (stats.thermal_enabled) {
+        const cv::Scalar fire_accent(40, 120, 255); // BGR orange-red
+        const cv::Scalar panel_accent = stats.fire_warning ? fire_accent : accent;
+        const int panel_y = static_cast<int>((stats.ambient_enabled ? 206 : 28) * ui);
+        const cv::Rect thermal_rect(frame.cols - static_cast<int>(340 * ui), panel_y,
+                                    static_cast<int>(300 * ui), static_cast<int>(120 * ui));
+        fill_translucent_rect(frame, thermal_rect, cv::Scalar(0, 0, 0), 0.58);
+        cv::rectangle(frame, thermal_rect, panel_accent, 1, cv::LINE_AA);
+        cv::putText(frame, "MLX90640 THERMAL",
+                    cv::Point(thermal_rect.x + static_cast<int>(18 * ui), thermal_rect.y + static_cast<int>(26 * ui)),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.48 * ui, panel_accent, 1, cv::LINE_AA);
+        cv::putText(frame, "STATUS " + stats.thermal_status,
+                    cv::Point(thermal_rect.x + static_cast<int>(18 * ui), thermal_rect.y + static_cast<int>(48 * ui)),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.42 * ui, dim_text, 1, cv::LINE_AA);
+        if (stats.thermal_valid) {
+            cv::putText(frame, "MAX",
+                        cv::Point(thermal_rect.x + static_cast<int>(18 * ui), thermal_rect.y + static_cast<int>(74 * ui)),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.44 * ui, dim_text, 1, cv::LINE_AA);
+            cv::putText(frame, cv::format("%.1fC", stats.thermal_max_c),
+                        cv::Point(thermal_rect.x + static_cast<int>(18 * ui), thermal_rect.y + static_cast<int>(106 * ui)),
+                        cv::FONT_HERSHEY_SIMPLEX, 1.02 * ui, stats.fire_warning ? fire_accent : text_color, 2,
+                        cv::LINE_AA);
+            cv::putText(frame, "MEAN",
+                        cv::Point(thermal_rect.x + static_cast<int>(160 * ui), thermal_rect.y + static_cast<int>(74 * ui)),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.44 * ui, dim_text, 1, cv::LINE_AA);
+            cv::putText(frame, cv::format("%.1fC", stats.thermal_mean_c),
+                        cv::Point(thermal_rect.x + static_cast<int>(160 * ui), thermal_rect.y + static_cast<int>(106 * ui)),
+                        cv::FONT_HERSHEY_SIMPLEX, 1.02 * ui, text_color, 2, cv::LINE_AA);
+        } else {
+            cv::putText(frame, "WAITING FOR SENSOR",
+                        cv::Point(thermal_rect.x + static_cast<int>(18 * ui), thermal_rect.y + static_cast<int>(92 * ui)),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.46 * ui, text_color, 1, cv::LINE_AA);
+        }
+    }
+
+    // --- Fire / hotspot warning banner (top-center) ---
+    if (stats.fire_warning) {
+        const cv::Scalar fire_accent(40, 120, 255);
+        const std::string warn = cv::format("FIRE / HOTSPOT  %.0fC", stats.thermal_max_c);
+        const double fs = 0.9 * ui;
+        int baseline = 0;
+        const cv::Size ts = cv::getTextSize(warn, cv::FONT_HERSHEY_SIMPLEX, fs, 2, &baseline);
+        const cv::Rect banner((frame.cols - ts.width) / 2 - static_cast<int>(20 * ui), static_cast<int>(62 * ui),
+                              ts.width + static_cast<int>(40 * ui), ts.height + static_cast<int>(24 * ui));
+        fill_translucent_rect(frame, banner, cv::Scalar(0, 0, 30), 0.62);
+        cv::rectangle(frame, banner, fire_accent, 2, cv::LINE_AA);
+        cv::putText(frame, warn,
+                    cv::Point(banner.x + static_cast<int>(20 * ui), banner.y + ts.height + static_cast<int>(10 * ui)),
+                    cv::FONT_HERSHEY_SIMPLEX, fs, cv::Scalar(60, 200, 255), 2, cv::LINE_AA);
     }
 }
 

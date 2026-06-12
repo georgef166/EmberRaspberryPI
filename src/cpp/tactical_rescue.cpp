@@ -1,6 +1,7 @@
 #include "ArducamTOFCamera.hpp"
 #include "tactical_rescue.hpp"
 #include "tactical_rescue_tflite.hpp"
+#include "tactical_rescue_thermal.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -130,6 +131,9 @@ bool parse_args(int argc, char* argv[], Options& opt)
         if (value == "tflite") {
             return DetectorSource::TFLITE;
         }
+        if (value == "thermal") {
+            return DetectorSource::THERMAL;
+        }
         std::cerr << "Unknown detector source: " << value << std::endl;
         std::exit(2);
     };
@@ -155,10 +159,17 @@ bool parse_args(int argc, char* argv[], Options& opt)
                 << "  --person-conf FLOAT      Human candidate confidence threshold (default 0.50)\n"
                 << "  --max-people NUM         Maximum rendered person detections\n"
                 << "  --detection-fps NUM      Detector cadence in frames per second\n"
-                << "  --detector-source MODE   auto | amplitude | confidence | pseudo | tflite\n"
+                << "  --detector-source MODE   auto | amplitude | confidence | pseudo | tflite | thermal\n"
                 << "  --tflite-model PATH      Path to TFLite SSD person detection model\n"
                 << "  --edgetpu                Run TFLite inference on the Coral Edge TPU\n"
                 << "  --person-class NUM       Model output index for 'person' (default 1; use 0 for Coral v2 COCO)\n"
+                << "  --no-thermal             Disable the MLX90640 thermal overlay/detector\n"
+                << "  --thermal-address HEX    MLX90640 I2C address (default 0x33)\n"
+                << "  --thermal-refresh HZ     MLX90640 refresh rate: 1|2|4|8|16|32|64 (default 8)\n"
+                << "  --emissivity FLOAT       Thermal emissivity (default 0.95)\n"
+                << "  --fire-temp C            Hotspot/fire warning threshold in C (default 60)\n"
+                << "  --victim-temp-min C      Warm-body band lower bound (default 26)\n"
+                << "  --victim-temp-max C      Warm-body band upper bound (default 45)\n"
                 << "  --am2302-gpio NUM        BCM GPIO used for AM2302 data (default 4)\n"
                 << "  --no-am2302              Disable AM2302 ambient overlay\n"
                 << "  --hud-scale NUM          HUD scale factor\n"
@@ -190,6 +201,20 @@ bool parse_args(int argc, char* argv[], Options& opt)
             opt.edgetpu = true;
         } else if (arg == "--person-class") {
             opt.person_class_id = std::max(0, std::atoi(require_value("--person-class")));
+        } else if (arg == "--no-thermal") {
+            opt.enable_thermal = false;
+        } else if (arg == "--thermal-address") {
+            opt.thermal_address = static_cast<int>(std::strtol(require_value("--thermal-address"), nullptr, 0));
+        } else if (arg == "--thermal-refresh") {
+            opt.thermal_refresh_hz = std::max(1, std::atoi(require_value("--thermal-refresh")));
+        } else if (arg == "--emissivity") {
+            opt.thermal_emissivity = std::atof(require_value("--emissivity"));
+        } else if (arg == "--fire-temp") {
+            opt.fire_temp_c = std::atof(require_value("--fire-temp"));
+        } else if (arg == "--victim-temp-min") {
+            opt.victim_temp_min_c = std::atof(require_value("--victim-temp-min"));
+        } else if (arg == "--victim-temp-max") {
+            opt.victim_temp_max_c = std::atof(require_value("--victim-temp-max"));
         } else if (arg == "--am2302-gpio") {
             opt.am2302_gpio = std::max(0, std::atoi(require_value("--am2302-gpio")));
         } else if (arg == "--no-am2302") {
@@ -257,24 +282,48 @@ int main(int argc, char* argv[])
     const bool tflite_available = file_exists(options.tflite_model_path) &&
                                   tflite_detector.load(options.tflite_model_path, options.edgetpu);
 
+    // --- MLX90640 THERMAL ---
+    // Open the thermal sensor. The thermal overlay and fire/hotspot warning
+    // render whenever the sensor is present, independent of which person
+    // detector is active. Selectable as a detector via --detector-source thermal.
+    Mlx90640Camera thermal_cam;
+    const bool thermal_available = options.enable_thermal && thermal_cam.open(options);
+
     DetectorSource active_detector_source = DetectorSource::CONFIDENCE;
     if (options.detector_source == DetectorSource::TFLITE) {
         active_detector_source = DetectorSource::TFLITE;
+    } else if (options.detector_source == DetectorSource::THERMAL) {
+        active_detector_source = DetectorSource::THERMAL;
     } else if (options.detector_source == DetectorSource::CONFIDENCE) {
         active_detector_source = DetectorSource::CONFIDENCE;
     } else if (options.detector_source == DetectorSource::PSEUDO) {
         active_detector_source = DetectorSource::PSEUDO;
     } else if (options.detector_source == DetectorSource::AUTO) {
-        // AUTO: prefer TFLite (Google) when model is present, fall back to CV heuristic
-        active_detector_source = tflite_available ? DetectorSource::TFLITE : DetectorSource::CONFIDENCE;
+        // AUTO preference: TFLite (Coral/CPU) when a model is loaded, else the
+        // thermal warm-body detector when the MLX90640 is present, else the CV heuristic.
+        if (tflite_available) {
+            active_detector_source = DetectorSource::TFLITE;
+        } else if (thermal_available) {
+            active_detector_source = DetectorSource::THERMAL;
+        } else {
+            active_detector_source = DetectorSource::CONFIDENCE;
+        }
     } else {
         active_detector_source = DetectorSource::AMPLITUDE;
+    }
+
+    if (active_detector_source == DetectorSource::THERMAL && !thermal_available) {
+        std::cerr << "Detector: thermal requested but MLX90640 unavailable — falling back to ToF confidence heuristic"
+                  << std::endl;
+        active_detector_source = DetectorSource::CONFIDENCE;
     }
 
     if (active_detector_source == DetectorSource::TFLITE) {
         std::cout << "Detector: TensorFlow Lite SSD person detection on "
                   << (tflite_detector.uses_edgetpu() ? "Coral Edge TPU" : "Raspberry Pi CPU")
                   << std::endl;
+    } else if (active_detector_source == DetectorSource::THERMAL) {
+        std::cout << "Detector: MLX90640 thermal warm-body detection" << std::endl;
     } else if (active_detector_source == DetectorSource::CONFIDENCE) {
         std::cout << "Detector input using ToF confidence heuristic" << std::endl;
     } else if (active_detector_source == DetectorSource::PSEUDO) {
@@ -290,6 +339,8 @@ int main(int argc, char* argv[])
     std::mutex detection_mutex;
     cv::Mat latest_detector_input;
     std::mutex detector_input_mutex;
+    ThermalFrame latest_thermal;
+    std::mutex thermal_mutex;
     RuntimeStats stats;
     std::mutex stats_mutex;
     std::atomic<bool> running{true};
@@ -299,6 +350,8 @@ int main(int argc, char* argv[])
         std::lock_guard<std::mutex> lock(stats_mutex);
         stats.ambient_enabled = options.enable_am2302;
         stats.ambient_status = options.enable_am2302 ? "INIT" : "DISABLED";
+        stats.thermal_enabled = thermal_available;
+        stats.thermal_status = thermal_available ? "INIT" : (options.enable_thermal ? "OFFLINE" : "DISABLED");
     }
 
     FpsCounter capture_fps;
@@ -389,6 +442,36 @@ int main(int argc, char* argv[])
         });
     }
 
+    std::thread thermal_thread;
+    if (thermal_available) {
+        thermal_thread = std::thread([&] {
+            while (running) {
+                ThermalFrame local;
+                if (!thermal_cam.read(local)) {
+                    std::lock_guard<std::mutex> lock(stats_mutex);
+                    stats.thermal_status = "ERROR";
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    continue;
+                }
+
+                {
+                    std::lock_guard<std::mutex> lock(thermal_mutex);
+                    latest_thermal = local;
+                }
+
+                std::lock_guard<std::mutex> lock(stats_mutex);
+                stats.thermal_valid = true;
+                stats.thermal_status = "GOOD";
+                stats.thermal_max_c = local.max_c;
+                stats.thermal_min_c = local.min_c;
+                stats.thermal_mean_c = local.mean_c;
+                stats.fire_warning = local.max_c >= options.fire_temp_c;
+                stats.thermal_updated_at = std::chrono::steady_clock::now();
+                stats.thermal_age_s = 0.0;
+            }
+        });
+    }
+
     std::thread inference_thread([&] {
         uint64_t consumed_frame = 0;
         auto last_inference_started = std::chrono::steady_clock::time_point::min();
@@ -432,10 +515,21 @@ int main(int argc, char* argv[])
             const auto infer_started = std::chrono::steady_clock::now();
             last_inference_started = infer_started;
             float best_person_score = 0.0f;
-            // [GOOGLE TFLITE] Route to TFLite inference or classical CV fallback
-            const DetectionState result = (active_detector_source == DetectorSource::TFLITE)
-                ? tflite_detector.detect(lidar_input, options, &best_person_score)
-                : run_tof_person_detector(lidar_input, active_detector_source, options, &best_person_score);
+            // Route to TFLite (Coral/CPU), MLX90640 thermal warm-body detection,
+            // or the classical ToF CV heuristic.
+            DetectionState result;
+            if (active_detector_source == DetectorSource::TFLITE) {
+                result = tflite_detector.detect(lidar_input, options, &best_person_score);
+            } else if (active_detector_source == DetectorSource::THERMAL) {
+                ThermalFrame thermal_input;
+                {
+                    std::lock_guard<std::mutex> lock(thermal_mutex);
+                    thermal_input = latest_thermal;
+                }
+                result = detect_thermal_people(thermal_input, lidar_input, options, &best_person_score);
+            } else {
+                result = run_tof_person_detector(lidar_input, active_detector_source, options, &best_person_score);
+            }
 
             {
                 std::lock_guard<std::mutex> lock(detection_mutex);
@@ -477,6 +571,17 @@ int main(int argc, char* argv[])
         float nearest_mm = 0.0f;
         cv::Mat hud = build_wireframe_overlay(frame.depth_mm, frame.confidence, options, nearest_mm);
 
+        // Thermal heat-map overlay on the wireframe (warm regions only), drawn
+        // before person boxes so detections sit on top.
+        if (thermal_available) {
+            ThermalFrame thermal_snapshot;
+            {
+                std::lock_guard<std::mutex> lock(thermal_mutex);
+                thermal_snapshot = latest_thermal;
+            }
+            draw_thermal_overlay(hud, thermal_snapshot, options);
+        }
+
         DetectionState detections;
         {
             std::lock_guard<std::mutex> lock(detection_mutex);
@@ -500,6 +605,10 @@ int main(int argc, char* argv[])
             if (stats.ambient_updated_at != std::chrono::steady_clock::time_point{}) {
                 stats.ambient_age_s =
                     std::chrono::duration<double>(std::chrono::steady_clock::now() - stats.ambient_updated_at).count();
+            }
+            if (stats.thermal_updated_at != std::chrono::steady_clock::time_point{}) {
+                stats.thermal_age_s =
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - stats.thermal_updated_at).count();
             }
             local_stats = stats;
         }
@@ -546,6 +655,9 @@ int main(int argc, char* argv[])
     }
     if (ambient_thread.joinable()) {
         ambient_thread.join();
+    }
+    if (thermal_thread.joinable()) {
+        thermal_thread.join();
     }
     if (inference_thread.joinable()) {
         inference_thread.join();

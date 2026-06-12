@@ -490,6 +490,8 @@ const char* detector_source_label(DetectorSource source)
         return "PSEUDO";
     case DetectorSource::TFLITE:
         return "TFLITE";
+    case DetectorSource::THERMAL:
+        return "THERM";
     case DetectorSource::AUTO:
     default:
         return "AUTO";
