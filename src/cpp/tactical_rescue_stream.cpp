@@ -8,6 +8,7 @@
 #include <sstream>
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <opencv2/imgcodecs.hpp>
 #include <sys/select.h>
@@ -52,6 +53,15 @@ bool MjpegStreamServer::start(const std::string& bind_address, int port, int jpe
     if (server_fd_ < 0) {
         std::cerr << "[stream] socket() failed: " << std::strerror(errno) << std::endl;
         return false;
+    }
+
+    // Mark the listening socket close-on-exec so child processes we fork+exec
+    // later (e.g. the AM2302 python helper) do NOT inherit it. Otherwise a
+    // leftover helper keeps port 8080 bound after the app exits, and the next
+    // launch's bind() fails with EADDRINUSE — silently disabling the feed.
+    const int fd_flags = ::fcntl(server_fd_, F_GETFD);
+    if (fd_flags >= 0) {
+        (void)::fcntl(server_fd_, F_SETFD, fd_flags | FD_CLOEXEC);
     }
 
     int reuse = 1;
