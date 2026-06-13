@@ -26,14 +26,14 @@ Ember replaces this handheld heat-map with an individual, hands-free spatial awa
 
 - Model file: `models/detect.tflite` (~4 MB, MobileNet SSD v1)
 - Inference cadence: 8 FPS on the Pi's 4 ARM Cortex-A72 cores
-- Input: ToF amplitude channel (infrared reflection intensity) normalized to 300×300 uint8 RGB
+- Input: fused ToF view (amplitude texture + colorized depth + confidence mask) resized to the model input
 - Output: depth-validated person bounding boxes, rendered into the tactical HUD
 
 > **Optional dependency:** there is **no apt package** for the TensorFlow Lite C++ library on Raspberry Pi OS — it must be [built from source](https://www.tensorflow.org/lite/guide/build_cmake). The build auto-detects it (`EMBER_HAVE_TFLITE`) and, when absent, simply omits the TFLite/Coral detectors — the ToF, **thermal**, and classical CV detectors all build and run without it. The thermal warm-body detector is the recommended victim path anyway and needs no TFLite at all.
 
-**Google Coral Edge TPU** (`libedgetpu`, optional) — when a Coral is attached, the `--coral` / `--edgetpu` backend offloads inference to the Edge TPU, freeing all 4 CPU cores for ToF rendering and running a heavier model (SSD MobileNet **v2** COCO) at ~70+ FPS. Setup via `./Install_coral.sh`; `./run.sh` auto-selects Coral when the Edge TPU runtime and model are present.
+**Google Coral Edge TPU** (`libedgetpu`, optional) — when a Coral is attached, the `--coral` / `--edgetpu` backend offloads inference to the Edge TPU, freeing all 4 CPU cores for ToF rendering and running a heavier model (SSD MobileNet **v2** COCO) at ~70+ FPS. Setup via `./Install_coral.sh`; it installs `libedgetpu`, downloads the Edge TPU model, and builds the matching local TFLite C++ runtime under `.ember-deps/`. `./run.sh` auto-selects Coral when the Edge TPU runtime and model are present.
 
-> **Note on detection quality:** the Coral accelerates inference and enables a heavier model, but it does not close the domain gap — the COCO model is trained on visible-light RGB while the input is the ToF amplitude (mono IR) channel. The largest accuracy gains will come from fine-tuning a detector on real ToF data, which the Coral can then run at high frame rates. The MLX90640 thermal channel (below) sidesteps this gap entirely.
+> **Note on detection quality:** the Coral accelerates inference and enables a heavier model, but it does not close the domain gap — the COCO model is trained on visible-light RGB while Ember feeds it a fused ToF composite instead of a normal camera image. The largest accuracy gains will come from fine-tuning a detector on real ToF data, which the Coral can then run at high frame rates. The MLX90640 thermal channel (below) sidesteps this gap entirely.
 
 ---
 
@@ -145,7 +145,7 @@ The CMake configure step prints `Coral Edge TPU support: ENABLED` when `libedget
 
 ```
 --detector-source MODE    auto | amplitude | confidence | pseudo | tflite | thermal
---tflite-input MODE       pseudo | depth | amplitude-debug (default: pseudo, depth fallback)
+--tflite-input MODE       fused | pseudo | depth | amplitude-debug (default: fused, depth fallback)
 --tflite-model PATH        Path to TFLite model (default: models/detect.tflite; Coral default: models/ssd_mobilenet_v2_coco_edgetpu.tflite)
 --edgetpu, --coral         Run TFLite inference on the Coral Edge TPU
 --person-class NUM         Model output index for 'person' (default 1; Coral default 0)
@@ -156,11 +156,13 @@ The CMake configure step prints `Coral Edge TPU support: ENABLED` when `libedget
 --fire-temp C              Hotspot/fire warning threshold in °C (default 60)
 --victim-temp-min C        Warm-body band lower bound in °C (default 26)
 --victim-temp-max C        Warm-body band upper bound in °C (default 45)
---range MM                 ToF range in mm (default: 4000)
---min-depth MM             Ignore geometry closer than this (default: 200)
+--range MM                 ToF range in mm (default: 4000, explicitly requested at startup)
+--min-depth MM             Ignore geometry closer than this (default: 50)
 --max-depth MM             Ignore geometry farther than this
+--confidence NUM           Depth confidence gate (default: 8)
 --person-conf FLOAT        TFLite detection confidence threshold (default: 0.50)
 --max-people NUM           Max simultaneous detections rendered (default: 4)
+--min-person-pixels NUM    Minimum rendered person box area (default: 900)
 --detection-fps NUM        Inference cadence in frames per second (default: 8; Coral default: 30)
 --no-am2302                Disable AM2302 ambient sensor overlay
 --stream                   Serve the rendered HUD over HTTP MJPEG
@@ -218,13 +220,13 @@ The CMake configure step prints `Coral Edge TPU support: ENABLED` when `libedget
 
 ## Detection Pipeline (TFLite)
 
-1. ToF amplitude frame (float32, 240×180) is normalized to uint8
-2. Resized to the model input size and expanded to 3-channel RGB
+1. ToF amplitude, depth, and confidence frames are fused into a 240×180 detector view
+2. Resized to the model input size and converted to RGB
 3. Fed into SSD MobileNet COCO (quantized, 4 output tensors: boxes, classes, scores, count) — on the Pi CPU, or the Coral Edge TPU with `--coral` / `--edgetpu`
-4. Person detections (class index `--person-class`) above the confidence threshold are filtered
+4. Person detections (class index `--person-class`) above the candidate threshold are filtered
 5. Bounding boxes scaled back to camera resolution
-6. Each box depth-validated against the live `depth_mm` frame
-7. Passed to temporal stabilizer → renderer
+6. Each box is validated against the live `depth_mm` and confidence frames
+7. Tiny boxes are rejected, duplicate boxes are suppressed, then detections must persist through the temporal stabilizer before rendering
 
 In `AUTO` mode, TFLite activates automatically when the model file is present; otherwise the **thermal** warm-body detector is used when the MLX90640 is present, falling back to the classical ToF geometry heuristic.
 

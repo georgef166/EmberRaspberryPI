@@ -143,6 +143,9 @@ bool parse_args(int argc, char* argv[], Options& opt)
         if (value == "amplitude" || value == "amplitude-debug") {
             return TfliteInputMode::AMPLITUDE;
         }
+        if (value == "fused") {
+            return TfliteInputMode::FUSED;
+        }
         if (value == "pseudo") {
             return TfliteInputMode::PSEUDO;
         }
@@ -168,14 +171,15 @@ bool parse_args(int argc, char* argv[], Options& opt)
                 << "Usage: tactical_rescue [options]\n"
                 << "  --device NUM             ToF camera device index\n"
                 << "  --range MM               ToF range in mm\n"
-                << "  --min-depth MM           Ignore geometry nearer than this\n"
+                << "  --min-depth MM           Ignore geometry nearer than this (default 50)\n"
                 << "  --max-depth MM           Ignore geometry farther than this\n"
-                << "  --confidence NUM         Depth confidence threshold\n"
+                << "  --confidence NUM         Depth confidence threshold (default 8)\n"
                 << "  --person-conf FLOAT      Human candidate confidence threshold (default 0.50)\n"
                 << "  --max-people NUM         Maximum rendered person detections\n"
+                << "  --min-person-pixels NUM  Minimum rendered person box area (default 900)\n"
                 << "  --detection-fps NUM      Detector cadence in frames per second\n"
                 << "  --detector-source MODE   auto | amplitude | confidence | pseudo | tflite | thermal\n"
-                << "  --tflite-input MODE      pseudo | depth | amplitude-debug (default pseudo, depth fallback)\n"
+                << "  --tflite-input MODE      fused | pseudo | depth | amplitude-debug (default fused)\n"
                 << "  --tflite-model PATH      Path to TFLite SSD person detection model\n"
                 << "  --edgetpu, --coral       Run TFLite inference on the Coral Edge TPU\n"
                 << "  --person-class NUM       Model output index for 'person' (default 1; Coral default 0)\n"
@@ -212,6 +216,8 @@ bool parse_args(int argc, char* argv[], Options& opt)
             opt.person_confidence = std::atof(require_value("--person-conf"));
         } else if (arg == "--max-people") {
             opt.max_people = std::max(1, std::atoi(require_value("--max-people")));
+        } else if (arg == "--min-person-pixels") {
+            opt.min_person_box_pixels = std::max(1, std::atoi(require_value("--min-person-pixels")));
         } else if (arg == "--detection-fps") {
             opt.detection_fps = std::max(1, std::atoi(require_value("--detection-fps")));
             opt.detection_fps_explicit = true;
@@ -314,12 +320,12 @@ int main(int argc, char* argv[])
     }
 
     int actual_range = options.range_mm;
-    if (options.range_mm != kDefaultRangeMm) {
-        if (tof.setControl(Control::RANGE, options.range_mm) == ArducamSuccess) {
-            tof.getControl(Control::RANGE, &actual_range);
-        }
+    if (tof.setControl(Control::RANGE, options.range_mm) == ArducamSuccess) {
+        tof.getControl(Control::RANGE, &actual_range);
     } else {
         tof.getControl(Control::RANGE, &actual_range);
+        std::cerr << "Warning: failed to set ToF range to " << options.range_mm << "mm; camera reports "
+                  << actual_range << "mm" << std::endl;
     }
     options.max_depth_mm = std::min(options.max_depth_mm, actual_range > 0 ? actual_range : options.range_mm);
 
@@ -571,7 +577,9 @@ int main(int argc, char* argv[])
             if (options.show_detector_input) {
                 cv::Mat detector_input;
                 if (active_detector_source == DetectorSource::TFLITE) {
-                    if (options.tflite_input_mode == TfliteInputMode::PSEUDO) {
+                    if (options.tflite_input_mode == TfliteInputMode::FUSED) {
+                        detector_input = build_fused_detector_input(lidar_input, options);
+                    } else if (options.tflite_input_mode == TfliteInputMode::PSEUDO) {
                         detector_input = build_pseudo_detector_input(lidar_input, options);
                     } else if (options.tflite_input_mode == TfliteInputMode::DEPTH) {
                         cv::Mat depth_gray = to_gray_preview(lidar_input.depth_mm, options);
@@ -666,7 +674,7 @@ int main(int argc, char* argv[])
         }
 
         float nearest_mm = 0.0f;
-        cv::Mat hud = build_wireframe_overlay(frame.depth_mm, frame.confidence, options, nearest_mm);
+        cv::Mat hud = build_wireframe_overlay(frame, options, nearest_mm);
 
         // Thermal heat-map overlay on the wireframe (warm regions only), drawn
         // before person boxes so detections sit on top.

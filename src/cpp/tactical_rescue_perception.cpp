@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <vector>
 
 #include <opencv2/imgproc.hpp>
 
@@ -32,6 +33,68 @@ cv::Mat remove_small_components(const cv::Mat& mask, int min_area)
     return filtered;
 }
 
+std::pair<float, float> visibility_percentiles(const cv::Mat& amplitude)
+{
+    std::vector<float> values;
+    values.reserve(static_cast<size_t>(amplitude.total()));
+    for (int y = 0; y < amplitude.rows; ++y) {
+        const float* row = amplitude.ptr<float>(y);
+        for (int x = 0; x < amplitude.cols; ++x) {
+            const float value = row[x];
+            if (std::isfinite(value) && value > 0.0f) {
+                values.push_back(value);
+            }
+        }
+    }
+
+    if (values.size() < 16) {
+        return {0.0f, 1.0f};
+    }
+
+    std::sort(values.begin(), values.end());
+    const size_t low_index = static_cast<size_t>((values.size() - 1) * 0.02f);
+    const size_t high_index = static_cast<size_t>((values.size() - 1) * 0.995f);
+    const float low = values[low_index];
+    const float high = values[high_index];
+    return {low, std::max(high, low + 1.0f)};
+}
+
+cv::Mat build_amplitude_visibility_base(const cv::Mat& amplitude)
+{
+    if (amplitude.empty()) {
+        return {};
+    }
+
+    const auto percentiles = visibility_percentiles(amplitude);
+    const float low = percentiles.first;
+    const float high = percentiles.second;
+    const float span = std::max(1.0f, high - low);
+
+    cv::Mat shifted;
+    amplitude.convertTo(shifted, CV_32F, 1.0, -low);
+    cv::threshold(shifted, shifted, 0.0, 0.0, cv::THRESH_TOZERO);
+    cv::threshold(shifted, shifted, span, span, cv::THRESH_TRUNC);
+
+    cv::Mat amp_u8;
+    shifted.convertTo(amp_u8, CV_8U, 255.0f / span);
+    cv::medianBlur(amp_u8, amp_u8, 3);
+
+    static cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(1.4, cv::Size(8, 8));
+    cv::Mat contrast;
+    clahe->apply(amp_u8, contrast);
+
+    cv::Mat blue;
+    cv::Mat green;
+    cv::Mat red;
+    contrast.convertTo(blue, CV_8U, 0.70);
+    contrast.convertTo(green, CV_8U, 0.58);
+    contrast.convertTo(red, CV_8U, 0.42);
+    std::vector<cv::Mat> channels = {blue, green, red};
+    cv::Mat base;
+    cv::merge(channels, base);
+    return base;
+}
+
 } // namespace
 
 cv::Mat to_gray_preview(const cv::Mat& depth_mm, const Options& opt)
@@ -51,40 +114,50 @@ cv::Mat to_gray_preview(const cv::Mat& depth_mm, const Options& opt)
 cv::Mat build_geometry_mask(const cv::Mat& depth_mm, const cv::Mat& confidence, const Options& opt)
 {
     cv::Mat valid = (depth_mm > static_cast<float>(opt.min_depth_mm)) &
-                    (depth_mm < static_cast<float>(opt.max_depth_mm)) &
-                    (confidence >= static_cast<float>(opt.confidence_threshold));
+                    (depth_mm < static_cast<float>(opt.max_depth_mm));
+    if (!confidence.empty()) {
+        cv::bitwise_and(valid, confidence >= static_cast<float>(opt.confidence_threshold), valid);
+    }
     valid.convertTo(valid, CV_8U, 255.0);
     return valid;
 }
 
-cv::Mat build_wireframe_overlay(const cv::Mat& depth_mm, const cv::Mat& confidence, const Options& opt,
-                                float& nearest_mm)
+cv::Mat build_fused_detector_input(const SharedFrame& lidar_frame, const Options& opt)
 {
+    const cv::Mat& depth_mm = lidar_frame.depth_mm;
+    const cv::Mat& confidence = lidar_frame.confidence;
+    cv::Mat overlay = build_amplitude_visibility_base(lidar_frame.amplitude);
+    if (overlay.empty()) {
+        overlay = cv::Mat(depth_mm.size(), CV_8UC3, cv::Scalar(0, 0, 0));
+    }
+
     cv::Mat geometry_mask = build_geometry_mask(depth_mm, confidence, opt);
     cv::morphologyEx(geometry_mask, geometry_mask, cv::MORPH_OPEN,
                      cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3)));
     geometry_mask = remove_small_components(geometry_mask, 20);
-    cv::Mat overlay(depth_mm.size(), CV_8UC3, cv::Scalar(0, 0, 0));
     if (cv::countNonZero(geometry_mask) < 32) {
-        nearest_mm = 0.0f;
         return overlay;
     }
 
     cv::Mat depth_gray = to_gray_preview(depth_mm, opt);
     depth_gray.setTo(0, geometry_mask == 0);
 
-    cv::Mat confidence_u8;
-    confidence.convertTo(confidence_u8, CV_8U, 255.0 / 1024.0);
-    confidence_u8.setTo(0, geometry_mask == 0);
-
-    cv::Mat stable_mask = confidence >= static_cast<float>(opt.confidence_threshold + 28);
-    stable_mask.convertTo(stable_mask, CV_8U, 255.0);
-    cv::bitwise_and(stable_mask, geometry_mask, stable_mask);
-    stable_mask = remove_small_components(stable_mask, 42);
-    if (cv::countNonZero(stable_mask) >= 32) {
-        geometry_mask = stable_mask;
-        depth_gray.setTo(0, geometry_mask == 0);
+    cv::Mat confidence_u8(depth_mm.size(), CV_8U, cv::Scalar(255));
+    if (!confidence.empty()) {
+        confidence.convertTo(confidence_u8, CV_8U, 255.0 / 1024.0);
         confidence_u8.setTo(0, geometry_mask == 0);
+    }
+
+    if (!confidence.empty()) {
+        cv::Mat stable_mask = confidence >= static_cast<float>(opt.confidence_threshold + 12);
+        stable_mask.convertTo(stable_mask, CV_8U, 255.0);
+        cv::bitwise_and(stable_mask, geometry_mask, stable_mask);
+        stable_mask = remove_small_components(stable_mask, 20);
+        if (cv::countNonZero(stable_mask) >= 32) {
+            geometry_mask = stable_mask;
+            depth_gray.setTo(0, geometry_mask == 0);
+            confidence_u8.setTo(0, geometry_mask == 0);
+        }
     }
 
     cv::Mat depth_smooth;
@@ -92,13 +165,14 @@ cv::Mat build_wireframe_overlay(const cv::Mat& depth_mm, const cv::Mat& confiden
     cv::GaussianBlur(depth_smooth, depth_smooth, cv::Size(3, 3), 0.0);
     depth_smooth.setTo(0, geometry_mask == 0);
 
-    cv::applyColorMap(depth_smooth, overlay, cv::COLORMAP_TURBO);
-    overlay.setTo(cv::Scalar(0, 0, 0), geometry_mask == 0);
+    cv::Mat depth_color;
+    cv::applyColorMap(depth_smooth, depth_color, cv::COLORMAP_TURBO);
+    depth_color.setTo(cv::Scalar(0, 0, 0), geometry_mask == 0);
 
     cv::Mat brightness;
     confidence_u8.convertTo(brightness, CV_32F, 0.35 / 255.0, 0.65);
     for (int y = 0; y < overlay.rows; ++y) {
-        cv::Vec3b* out_row = overlay.ptr<cv::Vec3b>(y);
+        cv::Vec3b* out_row = depth_color.ptr<cv::Vec3b>(y);
         const float* gain_row = brightness.ptr<float>(y);
         for (int x = 0; x < overlay.cols; ++x) {
             const float gain = gain_row[x];
@@ -107,6 +181,10 @@ cv::Mat build_wireframe_overlay(const cv::Mat& depth_mm, const cv::Mat& confiden
             out_row[x][2] = static_cast<uint8_t>(std::min(255.0f, out_row[x][2] * gain));
         }
     }
+
+    cv::Mat fused;
+    cv::addWeighted(depth_color, 0.78, overlay, 0.22, 0.0, fused);
+    fused.copyTo(overlay, geometry_mask);
 
     cv::Mat edges;
     cv::Canny(depth_smooth, edges, 34.0, 112.0, 3, true);
@@ -117,7 +195,33 @@ cv::Mat build_wireframe_overlay(const cv::Mat& depth_mm, const cv::Mat& confiden
     cv::dilate(edges, edges, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(2, 2)));
     overlay.setTo(cv::Scalar(255, 255, 255), edges > 0);
 
+    return overlay;
+}
+
+cv::Mat build_wireframe_overlay(const SharedFrame& lidar_frame, const Options& opt, float& nearest_mm)
+{
+    const cv::Mat& depth_mm = lidar_frame.depth_mm;
+    cv::Mat overlay = build_fused_detector_input(lidar_frame, opt);
+
+    cv::Mat geometry_mask = build_geometry_mask(lidar_frame.depth_mm, lidar_frame.confidence, opt);
+    cv::morphologyEx(geometry_mask, geometry_mask, cv::MORPH_OPEN,
+                     cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3)));
+    geometry_mask = remove_small_components(geometry_mask, 20);
+    if (!lidar_frame.confidence.empty()) {
+        cv::Mat stable_mask = lidar_frame.confidence >= static_cast<float>(opt.confidence_threshold + 12);
+        stable_mask.convertTo(stable_mask, CV_8U, 255.0);
+        cv::bitwise_and(stable_mask, geometry_mask, stable_mask);
+        stable_mask = remove_small_components(stable_mask, 20);
+        if (cv::countNonZero(stable_mask) >= 32) {
+            geometry_mask = stable_mask;
+        }
+    }
+
     nearest_mm = 0.0f;
+    if (cv::countNonZero(geometry_mask) < 32) {
+        return overlay;
+    }
+
     double min_depth = 0.0;
     cv::minMaxLoc(depth_mm, &min_depth, nullptr, nullptr, nullptr, geometry_mask);
     nearest_mm = static_cast<float>(min_depth);
@@ -744,6 +848,12 @@ DetectionState run_tof_person_detector(const SharedFrame& lidar_frame, DetectorS
                      std::max(1, static_cast<int>(std::round(height * scale_y))));
         box &= cv::Rect(0, 0, lidar_frame.depth_mm.cols, lidar_frame.depth_mm.rows);
         if (box.area() <= 0) {
+            continue;
+        }
+        const int min_box_width = std::max(20, lidar_frame.depth_mm.cols / 12);
+        const int min_box_height = std::max(32, lidar_frame.depth_mm.rows / 6);
+        if (box.width < min_box_width || box.height < min_box_height ||
+            box.area() < opt.min_person_box_pixels) {
             continue;
         }
         const float mean_depth = estimate_detection_depth_mm(lidar_frame.depth_mm(box), lidar_frame.confidence(box), {}, opt);

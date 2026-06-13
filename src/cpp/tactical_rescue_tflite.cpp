@@ -18,14 +18,14 @@
 //   - Output: detection_boxes, detection_classes, detection_scores, num_detections
 //
 // Pipeline:
-//   ToF amplitude frame (float32, 240x180)
-//     → normalize to uint8
-//     → resize to 300x300
-//     → expand to 3-channel RGB
-//     → TFLite Invoke()
-//     → filter class=1 (person) detections above confidence threshold
-//     → depth-validate each box against live depth_mm frame
-//     → return PersonDetection structs to renderer
+//   ToF fused frame (amplitude base + depth color + confidence mask, 240x180)
+//     -> resize to model input size
+//     -> convert to RGB
+//     -> TFLite Invoke()
+//     -> filter person detections above candidate threshold
+//     -> depth-validate each box against live depth_mm/confidence frame
+//     -> de-duplicate and temporally stabilize boxes
+//     -> return PersonDetection structs to renderer
 // =============================================================================
 
 #include "tactical_rescue_tflite.hpp"
@@ -59,7 +59,7 @@
 // leaving headroom for a larger/more accurate detector (e.g. SSD MobileNet v2).
 // =============================================================================
 #ifdef EMBER_HAVE_EDGETPU
-#include "edgetpu.h"
+#include "edgetpu_c.h"
 #endif
 
 namespace tactical_rescue {
@@ -100,7 +100,9 @@ cv::Mat build_depth_detector_input(const SharedFrame& frame, const Options& opt)
 cv::Mat build_tflite_detector_input(const SharedFrame& frame, const Options& opt)
 {
     cv::Mat detector_bgr;
-    if (opt.tflite_input_mode == TfliteInputMode::PSEUDO) {
+    if (opt.tflite_input_mode == TfliteInputMode::FUSED) {
+        detector_bgr = build_fused_detector_input(frame, opt);
+    } else if (opt.tflite_input_mode == TfliteInputMode::PSEUDO) {
         detector_bgr = build_pseudo_detector_input(frame, opt);
     } else if (opt.tflite_input_mode == TfliteInputMode::DEPTH) {
         detector_bgr = build_depth_detector_input(frame, opt);
@@ -138,9 +140,53 @@ cv::Point2f stable_rect_center(const cv::Rect& rect)
                        static_cast<float>(rect.y) + static_cast<float>(rect.height) * 0.5f);
 }
 
+bool has_stable_person_box_size(const cv::Rect& box, const cv::Size& frame_size, const Options& opt)
+{
+    const int frame_area = frame_size.width * frame_size.height;
+    const int min_width = std::max(20, frame_size.width / 12);
+    const int min_height = std::max(32, frame_size.height / 6);
+    const int min_area = std::max(opt.min_person_box_pixels, frame_area / 45);
+    if (box.width < min_width || box.height < min_height || box.area() < min_area) {
+        return false;
+    }
+
+    const float aspect = static_cast<float>(box.width) / static_cast<float>(box.height);
+    return aspect >= 0.18f && aspect <= 1.65f;
+}
+
+void suppress_overlapping_detections(std::vector<PersonDetection>& detections, float iou_threshold)
+{
+    if (detections.size() < 2) {
+        return;
+    }
+
+    std::sort(detections.begin(), detections.end(), [](const PersonDetection& lhs, const PersonDetection& rhs) {
+        if (lhs.confidence != rhs.confidence) {
+            return lhs.confidence > rhs.confidence;
+        }
+        return lhs.box.area() > rhs.box.area();
+    });
+
+    std::vector<PersonDetection> kept;
+    kept.reserve(detections.size());
+    for (const auto& detection : detections) {
+        bool overlaps_existing = false;
+        for (const auto& existing : kept) {
+            if (stable_rect_iou(cv::Rect2f(existing.box), detection.box) >= iou_threshold) {
+                overlaps_existing = true;
+                break;
+            }
+        }
+        if (!overlaps_existing) {
+            kept.push_back(detection);
+        }
+    }
+    detections = std::move(kept);
+}
+
 cv::Rect2f blend_track_box(const cv::Rect2f& previous, const cv::Rect& current)
 {
-    const float current_mix = 0.62f;
+    const float current_mix = 0.48f;
     const float previous_mix = 1.0f - current_mix;
     return cv::Rect2f(previous.x * previous_mix + static_cast<float>(current.x) * current_mix,
                       previous.y * previous_mix + static_cast<float>(current.y) * current_mix,
@@ -152,10 +198,12 @@ void stabilize_tflite_detections(std::vector<PersonDetection>& detections, uint6
                                  const Options& opt, float& best_confidence)
 {
     static std::vector<StableTfliteTrack> tracks;
+    const int confirm_hits = 5;
+    const int hold_misses = std::max(10, static_cast<int>(std::ceil(static_cast<float>(opt.detection_fps) * 1.5f)));
 
     for (auto& track : tracks) {
         ++track.misses;
-        track.confidence *= 0.91f;
+        track.confidence *= 0.985f;
     }
 
     std::vector<bool> claimed(tracks.size(), false);
@@ -188,11 +236,11 @@ void stabilize_tflite_detections(std::vector<PersonDetection>& detections, uint6
             }
         }
 
-        if (best_track >= 0 && best_score > 0.10f) {
+        if (best_track >= 0 && best_score > 0.18f) {
             auto& track = tracks[static_cast<size_t>(best_track)];
             claimed[static_cast<size_t>(best_track)] = true;
             track.box = blend_track_box(track.box, detection.box);
-            track.confidence = clamp01(track.confidence * 0.55f + detection.confidence * 0.45f + 0.035f);
+            track.confidence = clamp01(track.confidence * 0.70f + detection.confidence * 0.30f + 0.015f);
             track.mean_depth_mm =
                 detection.mean_depth_mm > 0.0f
                     ? (track.mean_depth_mm > 0.0f ? track.mean_depth_mm * 0.35f + detection.mean_depth_mm * 0.65f
@@ -215,19 +263,18 @@ void stabilize_tflite_detections(std::vector<PersonDetection>& detections, uint6
     }
 
     std::vector<PersonDetection> stable;
-    const float immediate_floor = std::max(0.30f, opt.person_confidence);
-    const float confirmed_floor = std::max(0.22f, opt.person_confidence - 0.16f);
+    const float confirmed_floor = std::max(0.24f, opt.person_confidence - 0.18f);
     const cv::Rect bounds(0, 0, frame_size.width, frame_size.height);
     for (const auto& track : tracks) {
-        const float held_confidence = clamp01(track.confidence * (1.0f - std::min(0.55f, track.misses * 0.08f)));
-        const bool strong_new_hit = track.misses == 0 && held_confidence >= immediate_floor;
-        const bool confirmed_track = track.hits >= 2 && track.misses <= 6 && held_confidence >= confirmed_floor;
-        if (!strong_new_hit && !confirmed_track) {
+        const float held_confidence = clamp01(track.confidence * (1.0f - std::min(0.18f, track.misses * 0.006f)));
+        const bool confirmed_track = track.hits >= confirm_hits && track.misses <= hold_misses &&
+                                     held_confidence >= confirmed_floor;
+        if (!confirmed_track) {
             continue;
         }
 
         cv::Rect box = cv::Rect(track.box) & bounds;
-        if (box.area() <= 0) {
+        if (box.area() <= 0 || !has_stable_person_box_size(box, frame_size, opt)) {
             continue;
         }
 
@@ -240,8 +287,8 @@ void stabilize_tflite_detections(std::vector<PersonDetection>& detections, uint6
         best_confidence = std::max(best_confidence, held_confidence);
     }
 
-    tracks.erase(std::remove_if(tracks.begin(), tracks.end(), [](const StableTfliteTrack& track) {
-                     return track.misses > 9 || track.confidence < 0.10f;
+    tracks.erase(std::remove_if(tracks.begin(), tracks.end(), [hold_misses](const StableTfliteTrack& track) {
+                     return track.misses > hold_misses + 15 || track.confidence < 0.05f;
                  }),
                  tracks.end());
 
@@ -255,21 +302,22 @@ void stabilize_tflite_detections(std::vector<PersonDetection>& detections, uint6
         return lhs.box.area() > rhs.box.area();
     });
     detections = std::move(stable);
+    suppress_overlapping_detections(detections, 0.42f);
 }
 
 } // namespace
 
 struct TFLitePersonDetector::Impl {
     std::unique_ptr<tflite::FlatBufferModel> model;
+#ifdef EMBER_HAVE_EDGETPU
+    // Keep the Coral delegate alive for the lifetime of the interpreter.
+    std::unique_ptr<TfLiteDelegate, void (*)(TfLiteDelegate*)> edgetpu_delegate{nullptr, edgetpu_free_delegate};
+#endif
     std::unique_ptr<tflite::Interpreter> interpreter;
     bool loaded = false;
     bool on_edgetpu = false;
     int input_w = kModelInputSize;
     int input_h = kModelInputSize;
-#ifdef EMBER_HAVE_EDGETPU
-    // Keep the Coral device context alive for the lifetime of the interpreter.
-    std::shared_ptr<edgetpu::EdgeTpuContext> edgetpu_context;
-#endif
 };
 
 TFLitePersonDetector::TFLitePersonDetector() : impl_(std::make_unique<Impl>()) {}
@@ -277,6 +325,13 @@ TFLitePersonDetector::~TFLitePersonDetector() = default;
 
 bool TFLitePersonDetector::load(const std::string& model_path, bool use_edgetpu)
 {
+    impl_->loaded = false;
+    impl_->on_edgetpu = false;
+    impl_->interpreter.reset();
+#ifdef EMBER_HAVE_EDGETPU
+    impl_->edgetpu_delegate.reset();
+#endif
+
     // [TFLite] Load flatbuffer model from disk into memory
     impl_->model = tflite::FlatBufferModel::BuildFromFile(model_path.c_str());
     if (!impl_->model) {
@@ -287,20 +342,7 @@ bool TFLitePersonDetector::load(const std::string& model_path, bool use_edgetpu)
     // [TFLite] Register built-in ops (Conv2D, DepthwiseConv, etc.).
     tflite::ops::builtin::BuiltinOpResolver resolver;
 
-#ifdef EMBER_HAVE_EDGETPU
-    // [Coral] Open the Edge TPU device and register its custom op so the
-    // interpreter can dispatch the edgetpu-custom-op subgraph to the Coral.
-    if (use_edgetpu) {
-        impl_->edgetpu_context = edgetpu::EdgeTpuManager::GetSingleton()->OpenDevice();
-        if (!impl_->edgetpu_context) {
-            std::cerr << "[Coral] No Edge TPU device found — falling back to CPU inference."
-                      << std::endl;
-            use_edgetpu = false;
-        } else {
-            resolver.AddCustom(edgetpu::kCustomOp, edgetpu::RegisterCustomOp());
-        }
-    }
-#else
+#ifndef EMBER_HAVE_EDGETPU
     if (use_edgetpu) {
         std::cerr << "[Coral] Binary built without Edge TPU support (libedgetpu not found at "
                      "build time) — falling back to CPU inference."
@@ -317,11 +359,27 @@ bool TFLitePersonDetector::load(const std::string& model_path, bool use_edgetpu)
 
 #ifdef EMBER_HAVE_EDGETPU
     if (use_edgetpu) {
-        // [Coral] Bind the interpreter to the opened Edge TPU context. With the TPU
-        // doing the heavy lifting, a single host thread is optimal (more just adds
-        // dispatch contention).
-        impl_->interpreter->SetExternalContext(kTfLiteEdgeTpuContext, impl_->edgetpu_context.get());
+        size_t device_count = 0;
+        std::unique_ptr<edgetpu_device, decltype(&edgetpu_free_devices)> devices(
+            edgetpu_list_devices(&device_count), &edgetpu_free_devices);
+        if (!devices || device_count == 0) {
+            std::cerr << "[Coral] No Edge TPU device found." << std::endl;
+            return false;
+        }
+
+        TfLiteDelegate* delegate = edgetpu_create_delegate(devices.get()[0].type, devices.get()[0].path, nullptr, 0);
+        if (!delegate) {
+            std::cerr << "[Coral] Failed to create Edge TPU delegate." << std::endl;
+            return false;
+        }
+
+        impl_->edgetpu_delegate.reset(delegate);
         impl_->interpreter->SetNumThreads(1);
+        if (impl_->interpreter->ModifyGraphWithDelegate(impl_->edgetpu_delegate.get()) != kTfLiteOk) {
+            std::cerr << "[Coral] Failed to attach Edge TPU delegate." << std::endl;
+            impl_->edgetpu_delegate.reset();
+            return false;
+        }
         impl_->on_edgetpu = true;
     } else
 #endif
@@ -416,7 +474,7 @@ DetectionState TFLitePersonDetector::detect(const SharedFrame& frame, const Opti
     const int fw = frame.depth_mm.cols;
     const int fh = frame.depth_mm.rows;
     float best_confidence = 0.0f;
-    const float candidate_floor = std::max(0.20f, opt.person_confidence - 0.25f);
+    const float candidate_floor = std::max(0.38f, opt.person_confidence - 0.12f);
 
     const float person_class_id = static_cast<float>(opt.person_class_id);
     for (int i = 0; i < n; ++i) {
@@ -438,7 +496,7 @@ DetectionState TFLitePersonDetector::detect(const SharedFrame& frame, const Opti
         cv::Rect box(static_cast<int>(xmin * fw), static_cast<int>(ymin * fh),
                      static_cast<int>((xmax - xmin) * fw), static_cast<int>((ymax - ymin) * fh));
         box &= cv::Rect(0, 0, fw, fh);
-        if (box.area() <= 0) {
+        if (box.area() <= 0 || !has_stable_person_box_size(box, frame.depth_mm.size(), opt)) {
             continue;
         }
 
@@ -450,7 +508,13 @@ DetectionState TFLitePersonDetector::detect(const SharedFrame& frame, const Opti
             confident.convertTo(confident, CV_8U, 255.0);
             cv::bitwise_and(valid_depth, confident, valid_depth);
         }
-        if (cv::countNonZero(valid_depth) == 0) {
+        const int valid_pixels = cv::countNonZero(valid_depth);
+        const int min_valid_pixels = std::max(90, box.area() / 10);
+        if (valid_pixels < min_valid_pixels) {
+            continue;
+        }
+        const float valid_ratio = static_cast<float>(valid_pixels) / static_cast<float>(box.area());
+        if (valid_ratio < 0.10f || (score < opt.person_confidence && valid_ratio < 0.16f)) {
             continue;
         }
 
@@ -467,6 +531,7 @@ DetectionState TFLitePersonDetector::detect(const SharedFrame& frame, const Opti
         state.people.push_back(det);
     }
 
+    suppress_overlapping_detections(state.people, 0.50f);
     stabilize_tflite_detections(state.people, frame.sequence, frame.depth_mm.size(), opt, best_confidence);
 
     std::sort(state.people.begin(), state.people.end(), [](const PersonDetection& a, const PersonDetection& b) {

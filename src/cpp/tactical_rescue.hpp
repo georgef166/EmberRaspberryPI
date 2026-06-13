@@ -11,7 +11,7 @@ namespace tactical_rescue {
 
 constexpr int kDefaultRangeMm = 4000;
 constexpr int kFrameTimeoutMs = 200;
-constexpr float kMinDepthMm = 200.0f;
+constexpr float kMinDepthMm = 50.0f;
 constexpr int kDisplayWidth = 1920;
 constexpr int kDisplayHeight = 1080;
 constexpr int kMaxRenderedPeople = 6;
@@ -41,6 +41,7 @@ enum class DetectorSource {
 
 enum class TfliteInputMode {
     AMPLITUDE,
+    FUSED,
     PSEUDO,
     DEPTH,
 };
@@ -54,13 +55,14 @@ constexpr int kDefaultThermalRefreshHz = 8;
 struct Options {
     int device = 0;
     int range_mm = kDefaultRangeMm;
-    int confidence_threshold = 30;
+    int confidence_threshold = 8;
     int min_depth_mm = static_cast<int>(kMinDepthMm);
     int max_depth_mm = kDefaultRangeMm;
     int hud_scale = 3;
     int detection_fps = kDefaultDetectionFps;
     int am2302_gpio = kDefaultAm2302Gpio;
     int max_people = 4;
+    int min_person_box_pixels = 900;
     float person_confidence = 0.50f;
     bool no_preview = false;
     bool show_detector_input = false;
@@ -71,7 +73,7 @@ struct Options {
     int stream_fps = kDefaultStreamFps;
     std::string stream_bind_address = kDefaultStreamBindAddress;
     DetectorSource detector_source = DetectorSource::AUTO;
-    TfliteInputMode tflite_input_mode = TfliteInputMode::PSEUDO;
+    TfliteInputMode tflite_input_mode = TfliteInputMode::FUSED;
     bool edgetpu = false; // Run TFLite inference on the Coral Edge TPU instead of the Pi CPU
     // COCO "person" output index. The bundled 91-class detect.tflite uses 1
     // (index 0 = background "???"). The Coral ssd_mobilenet_v2_coco model uses
@@ -213,8 +215,8 @@ bool file_exists(const std::string& path);
 const char* detector_source_label(DetectorSource source);
 cv::Mat to_gray_preview(const cv::Mat& depth_mm, const Options& opt);
 cv::Mat build_geometry_mask(const cv::Mat& depth_mm, const cv::Mat& confidence, const Options& opt);
-cv::Mat build_wireframe_overlay(const cv::Mat& depth_mm, const cv::Mat& confidence, const Options& opt,
-                                float& nearest_mm);
+cv::Mat build_fused_detector_input(const SharedFrame& lidar_frame, const Options& opt);
+cv::Mat build_wireframe_overlay(const SharedFrame& lidar_frame, const Options& opt, float& nearest_mm);
 cv::Mat build_amplitude_detector_input(const SharedFrame& lidar_frame, const Options& opt);
 cv::Mat build_confidence_detector_input(const SharedFrame& lidar_frame, const Options& opt);
 cv::Mat build_pseudo_detector_input(const SharedFrame& lidar_frame, const Options& opt);
