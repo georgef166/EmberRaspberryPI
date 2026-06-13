@@ -16,6 +16,7 @@ py_arducam/
 # Build artifacts
 CMakeFiles/
 build/
+.ember-deps/
 
 # Local git backup / downloads
 .git_backup/

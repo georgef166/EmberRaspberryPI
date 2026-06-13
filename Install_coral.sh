@@ -43,6 +43,9 @@ echo "== Downloading Edge TPU model"
 curl -fSL "$MODEL_URL" -o "$MODELS_DIR/ssd_mobilenet_v2_coco_edgetpu.tflite"
 curl -fSL "$LABELS_URL" -o "$MODELS_DIR/coco_labels.txt"
 
+echo "== Building Coral-compatible TensorFlow Lite C++ runtime"
+"$(cd "$(dirname "$0")" && pwd)/Build_tflite_coral.sh"
+
 echo ""
 echo "== Coral setup complete."
 echo "   Rebuild:  ./compile.sh   (look for 'Coral Edge TPU support: ENABLED')"

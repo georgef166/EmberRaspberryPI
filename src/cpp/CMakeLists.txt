@@ -16,8 +16,27 @@ target_link_libraries(capture_raw ${CXXLIBS} ${OpenCV_LIBS})
 # for the C++ library on Raspberry Pi OS (it must be built from source), so this
 # is intentionally NOT marked REQUIRED — the ToF, thermal, and classical CV
 # detectors all build and run without it.
-find_library(TFLITE_LIB tensorflow-lite)
-find_path(TFLITE_INCLUDE_DIR tensorflow/lite/interpreter.h)
+set(EMBER_LOCAL_TFLITE_BUILD "${CMAKE_SOURCE_DIR}/.ember-deps/tflite-coral-build")
+set(EMBER_LOCAL_TFLITE_SOURCE "${CMAKE_SOURCE_DIR}/.ember-deps/tensorflow-tflite-coral")
+set(EMBER_LOCAL_TFLITE_DEP_INCLUDES
+    "${EMBER_LOCAL_TFLITE_BUILD}/flatbuffers/include"
+    "${EMBER_LOCAL_TFLITE_BUILD}/abseil-cpp"
+    "${EMBER_LOCAL_TFLITE_BUILD}/eigen"
+    "${EMBER_LOCAL_TFLITE_BUILD}/gemmlowp"
+    "${EMBER_LOCAL_TFLITE_BUILD}/ruy"
+    "${EMBER_LOCAL_TFLITE_BUILD}/neon2sse")
+find_library(TFLITE_LIB tensorflow-lite
+    HINTS "${EMBER_LOCAL_TFLITE_BUILD}"
+    NO_DEFAULT_PATH)
+if(NOT TFLITE_LIB)
+    find_library(TFLITE_LIB tensorflow-lite)
+endif()
+find_path(TFLITE_INCLUDE_DIR tensorflow/lite/interpreter.h
+    HINTS "${EMBER_LOCAL_TFLITE_SOURCE}"
+    NO_DEFAULT_PATH)
+if(NOT TFLITE_INCLUDE_DIR)
+    find_path(TFLITE_INCLUDE_DIR tensorflow/lite/interpreter.h)
+endif()
 
 # Google Coral Edge TPU (libedgetpu) — optional, and requires TFLite.
 find_library(EDGETPU_LIB edgetpu)
@@ -46,11 +65,19 @@ target_link_libraries(tactical_rescue ${CXXLIBS} ${OpenCV_LIBS})
 # TensorFlow Lite (optional). The Coral backend lives under it: no TFLite, no Coral.
 if(TFLITE_LIB)
     message(STATUS "TensorFlow Lite support: ENABLED (${TFLITE_LIB})")
+    set_property(TARGET tactical_rescue PROPERTY CXX_STANDARD 17)
     target_compile_definitions(tactical_rescue PRIVATE EMBER_HAVE_TFLITE=1)
     target_link_libraries(tactical_rescue ${TFLITE_LIB})
+    get_filename_component(TFLITE_LIB_DIR "${TFLITE_LIB}" DIRECTORY)
+    set_property(TARGET tactical_rescue APPEND PROPERTY BUILD_RPATH "${TFLITE_LIB_DIR}")
     if(TFLITE_INCLUDE_DIR)
         target_include_directories(tactical_rescue PRIVATE ${TFLITE_INCLUDE_DIR})
     endif()
+    foreach(TFLITE_DEP_INCLUDE ${EMBER_LOCAL_TFLITE_DEP_INCLUDES})
+        if(EXISTS "${TFLITE_DEP_INCLUDE}")
+            target_include_directories(tactical_rescue PRIVATE "${TFLITE_DEP_INCLUDE}")
+        endif()
+    endforeach()
 
     if(EDGETPU_LIB)
         message(STATUS "Coral Edge TPU support: ENABLED (${EDGETPU_LIB})")
