@@ -18,6 +18,9 @@ CMakeFiles/
 build/
 .ember-deps/
 
+# Node artifacts (not part of this C++/CMake project)
+node_modules/
+
 # Local git backup / downloads
 .git_backup/
 *.zip
