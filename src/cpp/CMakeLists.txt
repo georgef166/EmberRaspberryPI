@@ -53,6 +53,7 @@ add_executable(
     tactical_rescue
     tactical_rescue.cpp
     tactical_rescue_capture.cpp
+    tactical_rescue_ground.cpp   # Ground plane RANSAC + AR navigation grid projection
     tactical_rescue_perception.cpp
     tactical_rescue_render.cpp
     tactical_rescue_stream.cpp  # Browser-viewable MJPEG HUD stream
