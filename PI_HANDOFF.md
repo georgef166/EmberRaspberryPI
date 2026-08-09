@@ -70,6 +70,50 @@ The one place it will genuinely cost something is the *next* milestone, not this
 there is no feature-based visual odometry, so keeping a breadcrumb pinned while the operator walks
 away from it will need depth-only ICP or an IMU. Not your problem today.
 
+## This branch is rebased onto a teammate's commander console — read this
+
+`ar-navigation` sits on top of `c8b6c3b feat(commander): interactive, password-gated commander
+console`, which landed on `main` in parallel with this work. Three things came out of that
+integration that you need to know:
+
+**1. The stream now has a password gate.** Default `admin`, or bypass with `--no-stream-auth`.
+See step 5.
+
+**2. Render layering changed, deliberately.** Both features draw on the 1920x1080 canvas now.
+Current order in the render loop, bottom to top:
+
+    compose_display_canvas()      // 240x180 scene, upscaled 6x
+      -> draw_ground_grid()       // world geometry (this feature)
+      -> draw_person_detection()  // victim boxes - the alert layer, must stay on top of the grid
+      -> draw_hud()               // HUD chrome
+      -> draw_stream_annotations()// commander markup, topmost
+
+If you touch this ordering, keep victim boxes above the grid. A grid line crossing a `VICTIM` box
+is cosmetic; a grid line *hiding* one is a safety regression.
+
+**3. There was a duplicate implementation, now collapsed. Do not re-split it.**
+The teammate added `display_canvas_transform(source, scale&, offset&)` and this feature added
+`compute_canvas_transform(source) -> CanvasTransform`. Both were the same letterbox math, arrived
+at independently, because both needed to stop overlays being nearest-neighbour upscaled.
+`display_canvas_transform` is now a thin adapter delegating to `compute_canvas_transform`
+(`tactical_rescue_render.cpp`). Keep it that way: if those two copies drift, the victim boxes and
+the ground grid will disagree about where a given floor pixel lands on screen, and that
+disagreement would be very hard to see and very easy to ship.
+
+### Worth flagging to the human: the two features nearly meet
+
+`StreamAnnotation` (`tactical_rescue_stream.hpp`) already has a `Type::Breadcrumb`, and the
+commander can drop a trail from the remote console. But `draw_stream_annotations()` maps them with
+normalized screen coordinates (`nx * w`, `ny * h`) — they are pinned to the **display**, not to the
+world. The moment the firefighter turns their head, a commander-placed breadcrumb slides off the
+spot it was meant to mark.
+
+This feature exports exactly the missing piece: `ray_plane_intersect()` converts a clicked pixel
+into a 3D point **on the floor**, and `project_point()` puts it back on screen from any later
+viewpoint. Wiring the commander's breadcrumbs through those two would make them stick to the actual
+floor. That is a follow-up, not your task today — but mention it, because it is the natural next
+milestone for both features and neither author has seen the other's code yet.
+
 ## What was added
 
 First 3D stage in Ember: detect the floor as a plane from ToF depth, then paint a
@@ -238,6 +282,15 @@ Expect `fit` ~1.6 ms and `inliers` ~15-35% of the cloud with the camera pitched 
 ### 5. Visual checks
 
     ./run.sh -- --stream        # then open http://<pi-ip>:8080/
+
+**The stream is now password-gated.** A teammate's commander-console feature landed on `main` and
+this branch is rebased onto it. Opening the URL prompts for a password — default `admin`
+(`kDefaultStreamPassword`). For bring-up you can skip the gate with `--no-stream-auth`:
+
+    ./run.sh -- --stream --no-stream-auth
+
+Tell the operator which one you used before they try to connect, or they will hit an unexpected
+login prompt mid-session.
 
 - Grid appears within ~0.5 s (3 confirm frames at 10 Hz), lies flat, converges to a vanishing
   point, fades with distance.
