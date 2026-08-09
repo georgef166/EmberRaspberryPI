@@ -197,6 +197,8 @@ bool parse_args(int argc, char* argv[], Options& opt)
                 << "  --stream-port NUM        Stream HTTP port (default 8080)\n"
                 << "  --stream-fps NUM         Stream frame rate cap (default 10)\n"
                 << "  --stream-quality NUM     Stream JPEG quality 20-95 (default 75)\n"
+                << "  --stream-password PASS   Commander view password (default 'admin')\n"
+                << "  --no-stream-auth         Disable the commander view password gate\n"
                 << "  --hud-scale NUM          HUD scale factor\n"
                 << "  --show-detector-input    Show the exact image sent to the ToF detector\n"
                 << "  --no-preview             Run acquisition/inference without UI\n";
@@ -261,6 +263,10 @@ bool parse_args(int argc, char* argv[], Options& opt)
             opt.stream_fps = std::max(1, std::atoi(require_value("--stream-fps")));
         } else if (arg == "--stream-quality") {
             opt.stream_jpeg_quality = std::max(20, std::min(95, std::atoi(require_value("--stream-quality"))));
+        } else if (arg == "--stream-password") {
+            opt.stream_password = require_value("--stream-password");
+        } else if (arg == "--no-stream-auth") {
+            opt.stream_auth_enabled = false;
         } else if (arg == "--hud-scale") {
             opt.hud_scale = std::max(1, std::atoi(require_value("--hud-scale")));
         } else if (arg == "--show-detector-input") {
@@ -427,7 +433,8 @@ int main(int argc, char* argv[])
     FpsCounter render_fps;
     MjpegStreamServer stream_server;
     if (options.enable_stream &&
-        !stream_server.start(options.stream_bind_address, options.stream_port, options.stream_jpeg_quality)) {
+        !stream_server.start(options.stream_bind_address, options.stream_port, options.stream_jpeg_quality,
+                             options.stream_auth_enabled, options.stream_password)) {
         std::cerr << "[stream] Remote feed disabled." << std::endl;
         options.enable_stream = false;
     }
@@ -692,13 +699,6 @@ int main(int argc, char* argv[])
             std::lock_guard<std::mutex> lock(detection_mutex);
             detections = latest_detection;
         }
-        if (detections.valid && detections.source_sequence <= frame.sequence) {
-            const int render_count = std::min(static_cast<int>(detections.people.size()), kMaxRenderedPeople);
-            for (int i = 0; i < render_count; ++i) {
-                draw_person_detection(hud, detections.people[i], i);
-            }
-        }
-
         render_fps.tick();
         RuntimeStats local_stats;
         {
@@ -718,8 +718,24 @@ int main(int argc, char* argv[])
             local_stats = stats;
         }
         cv::Mat display = compose_display_canvas(hud);
+        // Victim boxes are drawn on the full-resolution canvas, not on the
+        // 240x180 ToF frame — drawing them before the upscale magnified the
+        // label ~6x and turned the outline into chunky blocks.
+        if (detections.valid && detections.source_sequence <= frame.sequence) {
+            double det_scale = 1.0;
+            cv::Point det_offset(0, 0);
+            display_canvas_transform(hud.size(), det_scale, det_offset);
+            const int render_count = std::min(static_cast<int>(detections.people.size()), kMaxRenderedPeople);
+            for (int i = 0; i < render_count; ++i) {
+                draw_person_detection(display, detections.people[i], i, det_scale, det_offset);
+            }
+        }
         draw_hud(display, local_stats, detections, true, options.hud_scale);
+        // Commander markup (doors, breadcrumb trail, arrows) is burned into the
+        // shared display so it appears on both the remote console and the
+        // firefighter's local HUD.
         if (options.enable_stream) {
+            draw_stream_annotations(display, stream_server.annotations());
             const auto now = std::chrono::steady_clock::now();
             const auto stream_period = std::chrono::milliseconds(1000 / std::max(1, options.stream_fps));
             if (last_stream_publish == std::chrono::steady_clock::time_point::min() ||

@@ -1,4 +1,5 @@
 #include "tactical_rescue.hpp"
+#include "tactical_rescue_stream.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -10,10 +11,145 @@ namespace tactical_rescue {
 
 namespace {
 
+// Defined further down; the shared panel component below needs it.
+void fill_translucent_rect(cv::Mat& frame, const cv::Rect& rect, const cv::Scalar& color, double alpha);
+
 cv::Scalar person_color(int index)
 {
     (void)index;
     return cv::Scalar(0, 215, 255);
+}
+
+// --- Unified HUD typography -------------------------------------------------
+// Every string on the HUD goes through draw_text() so font, weight, and the
+// legibility outline stay identical across panels, labels, and commander markup.
+// Thickness used to be hardcoded to 1 or 2 regardless of size, which made small
+// text look blobby and inconsistent; it is now derived from the rendered scale.
+constexpr int kHudFont = cv::FONT_HERSHEY_DUPLEX;
+
+constexpr double kTextBrand = 0.86; // top-left brand mark
+constexpr double kTextValue = 1.02; // large numeric readouts
+constexpr double kTextTitle = 0.50; // panel headers
+constexpr double kTextBody = 0.50;  // status lines
+constexpr double kTextLabel = 0.44;  // small field labels
+constexpr double kTextBanner = 0.90; // fire / hotspot warning
+
+int text_thickness(double fs, bool bold)
+{
+    return bold ? std::max(2, static_cast<int>(std::round(fs * 2.0)))
+                : std::max(1, static_cast<int>(std::round(fs * 1.35)));
+}
+
+cv::Size measure_text(const std::string& text, double size, double ui, bool bold = false)
+{
+    const double fs = size * ui;
+    int baseline = 0;
+    return cv::getTextSize(text, kHudFont, fs, text_thickness(fs, bold), &baseline);
+}
+
+// Dark outline behind every glyph so text stays readable over bright thermal
+// blobs and dense wireframe geometry.
+void draw_text(cv::Mat& frame, const std::string& text, const cv::Point& origin, double size,
+               const cv::Scalar& color, double ui, bool bold = false)
+{
+    const double fs = size * ui;
+    const int thickness = text_thickness(fs, bold);
+    cv::putText(frame, text, origin, kHudFont, fs, cv::Scalar(0, 0, 0), thickness + 2, cv::LINE_AA);
+    cv::putText(frame, text, origin, kHudFont, fs, color, thickness, cv::LINE_AA);
+}
+
+// --- Shared HUD panel -------------------------------------------------------
+// Every corner block on the HUD is built from this one component, so the four
+// corners and the sensor readouts are literally the same thing rather than four
+// hand-rolled layouts. Structure follows the sensor panel: accent title, dim
+// uppercase labels, large light values, optional dim footer line.
+struct PanelField {
+    std::string label;
+    std::string value;
+};
+
+struct PanelLayout {
+    cv::Size size;
+    std::vector<int> col_x;
+    int pad = 0;
+    int title_baseline = 0;
+    int label_baseline = 0; // 0 when no field carries a label
+    int value_baseline = 0;
+    int footer_baseline = 0; // 0 when there is no footer
+};
+
+PanelLayout layout_panel(const std::string& title, const std::vector<PanelField>& fields, const std::string& footer,
+                         double ui)
+{
+    PanelLayout m;
+    m.pad = static_cast<int>(std::round(15 * ui));
+    const int col_gap = static_cast<int>(std::round(32 * ui));
+
+    const cv::Size title_size = measure_text(title, kTextTitle, ui, true);
+    const cv::Size label_probe = measure_text("HG", kTextLabel, ui);
+    const cv::Size value_probe = measure_text("0", kTextValue, ui, true);
+    const cv::Size footer_size = footer.empty() ? cv::Size(0, 0) : measure_text(footer, kTextLabel, ui);
+
+    bool any_label = false;
+    for (const auto& f : fields) {
+        if (!f.label.empty()) {
+            any_label = true;
+        }
+    }
+
+    int x = m.pad;
+    int content_w = 0;
+    for (size_t i = 0; i < fields.size(); ++i) {
+        const int lw = fields[i].label.empty() ? 0 : measure_text(fields[i].label, kTextLabel, ui).width;
+        const int vw = measure_text(fields[i].value, kTextValue, ui, true).width;
+        const int cw = std::max(lw, vw);
+        m.col_x.push_back(x);
+        x += cw + col_gap;
+        content_w += cw + (i + 1 < fields.size() ? col_gap : 0);
+    }
+
+    int y = m.pad + title_size.height;
+    m.title_baseline = y;
+    if (any_label) {
+        y += static_cast<int>(std::round(20 * ui)) + label_probe.height;
+        m.label_baseline = y;
+    }
+    if (!fields.empty()) {
+        y += static_cast<int>(std::round(15 * ui)) + value_probe.height;
+        m.value_baseline = y;
+    }
+    if (!footer.empty()) {
+        y += static_cast<int>(std::round(18 * ui)) + footer_size.height;
+        m.footer_baseline = y;
+    }
+
+    const int inner = std::max(std::max(content_w, title_size.width), footer_size.width);
+    m.size = cv::Size(inner + m.pad * 2, y + m.pad);
+    return m;
+}
+
+// Draws the panel with its top-left at `origin`. Callers anchor corners by
+// offsetting with the size returned from layout_panel().
+void draw_panel(cv::Mat& frame, const cv::Point& origin, const std::string& title,
+                const std::vector<PanelField>& fields, const std::string& footer, const cv::Scalar& accent,
+                const cv::Scalar& value_color, const cv::Scalar& dim_color, double ui)
+{
+    const PanelLayout m = layout_panel(title, fields, footer, ui);
+    const cv::Rect rect(origin.x, origin.y, m.size.width, m.size.height);
+    fill_translucent_rect(frame, rect, cv::Scalar(0, 0, 0), 0.58);
+    cv::rectangle(frame, rect, accent, 1, cv::LINE_AA);
+
+    draw_text(frame, title, cv::Point(rect.x + m.pad, rect.y + m.title_baseline), kTextTitle, accent, ui, true);
+    for (size_t i = 0; i < fields.size() && i < m.col_x.size(); ++i) {
+        const int cx = rect.x + m.col_x[i];
+        if (m.label_baseline && !fields[i].label.empty()) {
+            draw_text(frame, fields[i].label, cv::Point(cx, rect.y + m.label_baseline), kTextLabel, dim_color, ui);
+        }
+        draw_text(frame, fields[i].value, cv::Point(cx, rect.y + m.value_baseline), kTextValue, value_color, ui, true);
+    }
+    if (m.footer_baseline) {
+        draw_text(frame, footer, cv::Point(rect.x + m.pad, rect.y + m.footer_baseline), kTextLabel, dim_color, ui);
+    }
 }
 
 void fill_translucent_rect(cv::Mat& frame, const cv::Rect& rect, const cv::Scalar& color, double alpha)
@@ -216,51 +352,83 @@ void draw_reference_vitals(cv::Mat& frame, const cv::Rect& rect, int heading, co
 
 } // namespace
 
-void draw_person_detection(cv::Mat& frame, const PersonDetection& detection, int index)
+void display_canvas_transform(const cv::Size& source, double& scale, cv::Point& offset)
+{
+    if (source.width <= 0 || source.height <= 0) {
+        scale = 1.0;
+        offset = cv::Point(0, 0);
+        return;
+    }
+    const double fit = std::min(static_cast<double>(kDisplayWidth) / static_cast<double>(source.width),
+                                static_cast<double>(kDisplayHeight) / static_cast<double>(source.height));
+    const int w = std::max(1, static_cast<int>(std::round(source.width * fit)));
+    const int h = std::max(1, static_cast<int>(std::round(source.height * fit)));
+    scale = fit;
+    offset = cv::Point((kDisplayWidth - w) / 2, (kDisplayHeight - h) / 2);
+}
+
+void draw_person_detection(cv::Mat& frame, const PersonDetection& detection, int index, double scale,
+                           const cv::Point& offset)
 {
     if (!detection.valid || detection.box.area() <= 0) {
         return;
     }
 
     const cv::Scalar color = person_color(index);
-    const int x = detection.box.x;
-    const int y = detection.box.y;
-    const int width = detection.box.width;
-    const int height = detection.box.height;
-    const int corner = std::max(4, std::min(std::min(width, height) / 4, 12));
+    // Box arrives in ToF-frame coordinates; map it into whatever frame we are
+    // drawing on so the outline and label render at that frame's resolution.
+    const int x = static_cast<int>(std::round(detection.box.x * scale)) + offset.x;
+    const int y = static_cast<int>(std::round(detection.box.y * scale)) + offset.y;
+    const int width = static_cast<int>(std::round(detection.box.width * scale));
+    const int height = static_cast<int>(std::round(detection.box.height * scale));
+    // Stroke weights scale with the target frame, not the sensor frame.
+    const double s = std::max(1.0, frame.cols / 1280.0);
+    const int stroke = std::max(1, static_cast<int>(std::round(2.0 * s)));
+    const int corner = std::max(static_cast<int>(std::round(14 * s)),
+                                std::min(std::min(width, height) / 5, static_cast<int>(std::round(46 * s))));
 
-    cv::line(frame, cv::Point(x, y + corner), cv::Point(x, y), color, 1, cv::LINE_AA);
-    cv::line(frame, cv::Point(x, y), cv::Point(x + corner, y), color, 1, cv::LINE_AA);
+    // Corner brackets only — a full box hides too much of the geometry.
+    cv::line(frame, cv::Point(x, y + corner), cv::Point(x, y), color, stroke, cv::LINE_AA);
+    cv::line(frame, cv::Point(x, y), cv::Point(x + corner, y), color, stroke, cv::LINE_AA);
 
-    cv::line(frame, cv::Point(x + width - corner, y), cv::Point(x + width, y), color, 1, cv::LINE_AA);
-    cv::line(frame, cv::Point(x + width, y), cv::Point(x + width, y + corner), color, 1, cv::LINE_AA);
+    cv::line(frame, cv::Point(x + width - corner, y), cv::Point(x + width, y), color, stroke, cv::LINE_AA);
+    cv::line(frame, cv::Point(x + width, y), cv::Point(x + width, y + corner), color, stroke, cv::LINE_AA);
 
-    cv::line(frame, cv::Point(x + width, y + height - corner), cv::Point(x + width, y + height), color, 1,
+    cv::line(frame, cv::Point(x + width, y + height - corner), cv::Point(x + width, y + height), color, stroke,
              cv::LINE_AA);
-    cv::line(frame, cv::Point(x + width, y + height), cv::Point(x + width - corner, y + height), color, 1,
+    cv::line(frame, cv::Point(x + width, y + height), cv::Point(x + width - corner, y + height), color, stroke,
              cv::LINE_AA);
 
-    cv::line(frame, cv::Point(x + corner, y + height), cv::Point(x, y + height), color, 1, cv::LINE_AA);
-    cv::line(frame, cv::Point(x, y + height), cv::Point(x, y + height - corner), color, 1, cv::LINE_AA);
+    cv::line(frame, cv::Point(x + corner, y + height), cv::Point(x, y + height), color, stroke, cv::LINE_AA);
+    cv::line(frame, cv::Point(x, y + height), cv::Point(x, y + height - corner), color, stroke, cv::LINE_AA);
 
-    cv::rectangle(frame, detection.box, cv::Scalar(0, 90, 110), 1, cv::LINE_AA);
+    cv::rectangle(frame, cv::Rect(x, y, width, height), cv::Scalar(30, 120, 145), 1, cv::LINE_AA);
 
     const std::string label =
-        "VICTIM [" + std::to_string(static_cast<int>(std::round(detection.confidence * 100))) + "%]";
-    int baseline = 0;
-    const cv::Size text_size = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, 0.45, 1, &baseline);
-    const int label_height = text_size.height + 8;
-    const int label_width = text_size.width + 8;
+        "VICTIM " + std::to_string(static_cast<int>(std::round(detection.confidence * 100))) + "%";
+    // Solid chip, so this is the one place that skips the outline — black on
+    // amber is already maximum contrast. Font/weight come from the shared
+    // typography constants, sized to the frame being drawn on.
+    const cv::Size text_size = measure_text(label, kTextLabel, s, true);
+    const int pad = static_cast<int>(std::round(6 * s));
+    const int label_height = text_size.height + pad * 2;
+    const int label_width = text_size.width + pad * 2;
     const int label_x = std::max(0, std::min(x, frame.cols - label_width));
-    const int label_y = std::max(0, y - label_height - 2);
-    cv::rectangle(frame, cv::Rect(label_x, label_y, label_width, label_height), color, cv::FILLED);
-    cv::putText(frame, label, cv::Point(label_x + 4, label_y + text_size.height + 2), cv::FONT_HERSHEY_SIMPLEX, 0.45,
-                cv::Scalar(0, 0, 0), 1, cv::LINE_AA);
+    // Prefer above the box; drop inside the top edge when there is no room.
+    const int label_y = (y - label_height - static_cast<int>(std::round(3 * s)) >= 0)
+                            ? y - label_height - static_cast<int>(std::round(3 * s))
+                            : std::min(y, frame.rows - label_height);
+    cv::rectangle(frame, cv::Rect(label_x, std::max(0, label_y), label_width, label_height), color, cv::FILLED);
+    cv::putText(frame, label, cv::Point(label_x + pad, std::max(0, label_y) + pad + text_size.height), kHudFont,
+                kTextLabel * s, cv::Scalar(12, 12, 12), text_thickness(kTextLabel * s, true), cv::LINE_AA);
 
     const int center_x = x + width / 2;
     const int center_y = y + height / 2;
-    cv::line(frame, cv::Point(center_x - 4, center_y), cv::Point(center_x + 4, center_y), color, 1, cv::LINE_AA);
-    cv::line(frame, cv::Point(center_x, center_y - 4), cv::Point(center_x, center_y + 4), color, 1, cv::LINE_AA);
+    const int tick = static_cast<int>(std::round(7 * s));
+    cv::line(frame, cv::Point(center_x - tick, center_y), cv::Point(center_x + tick, center_y), color, stroke,
+             cv::LINE_AA);
+    cv::line(frame, cv::Point(center_x, center_y - tick), cv::Point(center_x, center_y + tick), color, stroke,
+             cv::LINE_AA);
 }
 
 void draw_thermal_overlay(cv::Mat& frame, const ThermalFrame& thermal, const Options& opt)
@@ -312,120 +480,173 @@ void draw_hud(cv::Mat& frame, const RuntimeStats& stats, const DetectionState& d
     const std::string mode_text = detector_enabled
                                       ? (primary_detection ? "TRACK LOCK" : "SCANNING")
                                       : "DETECTOR OFF";
-    const std::string info_text = "IGNISXR NAV  |  " + stats.detector_source_label + "  |  " + mode_text;
-    const std::string perf_text =
-        "FPS " + std::to_string(static_cast<int>(std::round(stats.render_fps))) + "  DETECT " +
-        std::to_string(static_cast<int>(std::round(stats.inference_ms))) + "ms  RANGE " +
-        std::to_string(static_cast<int>(std::round(stats.nearest_obstacle_mm))) + "mm";
-    const std::string people_text = "HUMANS " + std::to_string(stats.detected_people) + "  BEST " +
-                                    std::to_string(static_cast<int>(std::round(stats.best_person_score * 100))) + "%";
 
-    fill_translucent_rect(frame, cv::Rect(18, 18, static_cast<int>(420 * ui), static_cast<int>(34 * ui)), cv::Scalar(0, 0, 0),
-                          0.45);
-    cv::putText(frame, info_text, cv::Point(28, static_cast<int>(40 * ui)), cv::FONT_HERSHEY_SIMPLEX, 0.58 * ui,
-                accent, 2, cv::LINE_AA);
+    const int margin = static_cast<int>(std::round(22 * ui));
+    const int gap = static_cast<int>(std::round(12 * ui));
 
-    fill_translucent_rect(frame,
-                          cv::Rect(18, frame.rows - static_cast<int>(58 * ui), static_cast<int>(520 * ui),
-                                   static_cast<int>(40 * ui)),
-                          cv::Scalar(0, 0, 0), 0.45);
-    cv::putText(frame, perf_text, cv::Point(28, frame.rows - static_cast<int>(28 * ui)), cv::FONT_HERSHEY_SIMPLEX,
-                0.50 * ui, text_color, 1, cv::LINE_AA);
-    cv::putText(frame, people_text,
-                cv::Point(frame.cols - static_cast<int>(250 * ui), frame.rows - static_cast<int>(28 * ui)),
-                cv::FONT_HERSHEY_SIMPLEX, 0.50 * ui, dim_text, 1, cv::LINE_AA);
-
-    if (stats.ambient_enabled) {
-        const cv::Rect ambient_rect(frame.cols - static_cast<int>(340 * ui), static_cast<int>(28 * ui),
-                                    static_cast<int>(300 * ui), static_cast<int>(166 * ui));
-        fill_translucent_rect(frame, ambient_rect, cv::Scalar(0, 0, 0), 0.58);
-        cv::rectangle(frame, ambient_rect, accent, 1, cv::LINE_AA);
-        cv::putText(frame, "AM2302", cv::Point(ambient_rect.x + static_cast<int>(18 * ui),
-                                               ambient_rect.y + static_cast<int>(26 * ui)),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.48 * ui, accent, 1, cv::LINE_AA);
-
-        const std::string status_text = "STATUS " + stats.ambient_status;
-        cv::putText(frame, status_text,
-                    cv::Point(ambient_rect.x + static_cast<int>(18 * ui), ambient_rect.y + static_cast<int>(48 * ui)),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.42 * ui, dim_text, 1, cv::LINE_AA);
-
-        if (stats.ambient_valid) {
-            const std::string age_text = cv::format("AGE %.1fs", stats.ambient_age_s);
-
-            cv::putText(frame, "TEMP",
-                        cv::Point(ambient_rect.x + static_cast<int>(18 * ui), ambient_rect.y + static_cast<int>(78 * ui)),
-                        cv::FONT_HERSHEY_SIMPLEX, 0.44 * ui, dim_text, 1, cv::LINE_AA);
-            cv::putText(frame, cv::format("%.1fC", stats.ambient_temperature_c),
-                        cv::Point(ambient_rect.x + static_cast<int>(18 * ui), ambient_rect.y + static_cast<int>(116 * ui)),
-                        cv::FONT_HERSHEY_SIMPLEX, 1.08 * ui, text_color, 2, cv::LINE_AA);
-
-            cv::putText(frame, "HUMIDITY",
-                        cv::Point(ambient_rect.x + static_cast<int>(160 * ui), ambient_rect.y + static_cast<int>(78 * ui)),
-                        cv::FONT_HERSHEY_SIMPLEX, 0.44 * ui, dim_text, 1, cv::LINE_AA);
-            cv::putText(frame, cv::format("%.1f%%", stats.ambient_humidity_percent),
-                        cv::Point(ambient_rect.x + static_cast<int>(160 * ui), ambient_rect.y + static_cast<int>(116 * ui)),
-                        cv::FONT_HERSHEY_SIMPLEX, 1.08 * ui, text_color, 2, cv::LINE_AA);
-
-            cv::putText(frame, age_text,
-                        cv::Point(ambient_rect.x + static_cast<int>(18 * ui), ambient_rect.y + static_cast<int>(148 * ui)),
-                        cv::FONT_HERSHEY_SIMPLEX, 0.42 * ui, dim_text, 1, cv::LINE_AA);
-        } else {
-            cv::putText(frame, "WAITING FOR SENSOR",
-                        cv::Point(ambient_rect.x + static_cast<int>(18 * ui), ambient_rect.y + static_cast<int>(106 * ui)),
-                        cv::FONT_HERSHEY_SIMPLEX, 0.46 * ui, text_color, 1, cv::LINE_AA);
-        }
+    // --- Top-left: identity. Same panel grammar as the sensor readouts, with
+    // the wordmark occupying the "value" slot.
+    {
+        const std::vector<PanelField> fields = {{"", "Ember"}};
+        draw_panel(frame, cv::Point(margin, margin), "IGNISXR", fields, "", accent, text_color, dim_text, ui);
     }
 
-    // --- MLX90640 thermal readout (top-right, below the ambient panel) ---
+    // --- Top-right: ambient, then thermal stacked beneath it.
+    int right_y = margin;
+    if (stats.ambient_enabled) {
+        std::vector<PanelField> fields;
+        std::string footer = "STATUS " + stats.ambient_status;
+        if (stats.ambient_valid) {
+            fields.push_back({"TEMP", cv::format("%.1fC", stats.ambient_temperature_c)});
+            fields.push_back({"HUMIDITY", cv::format("%.1f%%", stats.ambient_humidity_percent)});
+            // ASCII only — the Hershey fonts have no glyph for U+00B7 and render
+            // it as "??".
+            footer += cv::format("   /   AGE %.1fs", stats.ambient_age_s);
+        } else {
+            // No reading yet: title + status only, rather than a placeholder value.
+            footer = "WAITING FOR SENSOR";
+        }
+        const PanelLayout m = layout_panel("AM2302", fields, footer, ui);
+        draw_panel(frame, cv::Point(frame.cols - m.size.width - margin, right_y), "AM2302", fields, footer, accent,
+                   text_color, dim_text, ui);
+        right_y += m.size.height + gap;
+    }
+
     if (stats.thermal_enabled) {
         const cv::Scalar fire_accent(40, 120, 255); // BGR orange-red
         const cv::Scalar panel_accent = stats.fire_warning ? fire_accent : accent;
-        const int panel_y = static_cast<int>((stats.ambient_enabled ? 206 : 28) * ui);
-        const cv::Rect thermal_rect(frame.cols - static_cast<int>(340 * ui), panel_y,
-                                    static_cast<int>(300 * ui), static_cast<int>(120 * ui));
-        fill_translucent_rect(frame, thermal_rect, cv::Scalar(0, 0, 0), 0.58);
-        cv::rectangle(frame, thermal_rect, panel_accent, 1, cv::LINE_AA);
-        cv::putText(frame, "MLX90640 THERMAL",
-                    cv::Point(thermal_rect.x + static_cast<int>(18 * ui), thermal_rect.y + static_cast<int>(26 * ui)),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.48 * ui, panel_accent, 1, cv::LINE_AA);
-        cv::putText(frame, "STATUS " + stats.thermal_status,
-                    cv::Point(thermal_rect.x + static_cast<int>(18 * ui), thermal_rect.y + static_cast<int>(48 * ui)),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.42 * ui, dim_text, 1, cv::LINE_AA);
+        std::vector<PanelField> fields;
+        std::string footer = "STATUS " + stats.thermal_status;
         if (stats.thermal_valid) {
-            cv::putText(frame, "MAX",
-                        cv::Point(thermal_rect.x + static_cast<int>(18 * ui), thermal_rect.y + static_cast<int>(74 * ui)),
-                        cv::FONT_HERSHEY_SIMPLEX, 0.44 * ui, dim_text, 1, cv::LINE_AA);
-            cv::putText(frame, cv::format("%.1fC", stats.thermal_max_c),
-                        cv::Point(thermal_rect.x + static_cast<int>(18 * ui), thermal_rect.y + static_cast<int>(106 * ui)),
-                        cv::FONT_HERSHEY_SIMPLEX, 1.02 * ui, stats.fire_warning ? fire_accent : text_color, 2,
-                        cv::LINE_AA);
-            cv::putText(frame, "MEAN",
-                        cv::Point(thermal_rect.x + static_cast<int>(160 * ui), thermal_rect.y + static_cast<int>(74 * ui)),
-                        cv::FONT_HERSHEY_SIMPLEX, 0.44 * ui, dim_text, 1, cv::LINE_AA);
-            cv::putText(frame, cv::format("%.1fC", stats.thermal_mean_c),
-                        cv::Point(thermal_rect.x + static_cast<int>(160 * ui), thermal_rect.y + static_cast<int>(106 * ui)),
-                        cv::FONT_HERSHEY_SIMPLEX, 1.02 * ui, text_color, 2, cv::LINE_AA);
+            fields.push_back({"MAX", cv::format("%.1fC", stats.thermal_max_c)});
+            fields.push_back({"MEAN", cv::format("%.1fC", stats.thermal_mean_c)});
         } else {
-            cv::putText(frame, "WAITING FOR SENSOR",
-                        cv::Point(thermal_rect.x + static_cast<int>(18 * ui), thermal_rect.y + static_cast<int>(92 * ui)),
-                        cv::FONT_HERSHEY_SIMPLEX, 0.46 * ui, text_color, 1, cv::LINE_AA);
+            footer = "WAITING FOR SENSOR";
         }
+        const PanelLayout m = layout_panel("MLX90640", fields, footer, ui);
+        draw_panel(frame, cv::Point(frame.cols - m.size.width - margin, right_y), "MLX90640", fields, footer,
+                   panel_accent, stats.fire_warning ? fire_accent : text_color, dim_text, ui);
+    }
+
+    // --- Bottom-left: system telemetry.
+    {
+        const std::vector<PanelField> fields = {
+            {"FPS", std::to_string(static_cast<int>(std::round(stats.render_fps)))},
+            {"DETECT", std::to_string(static_cast<int>(std::round(stats.inference_ms))) + "ms"},
+            {"RANGE", std::to_string(static_cast<int>(std::round(stats.nearest_obstacle_mm))) + "mm"},
+        };
+        const std::string footer = stats.detector_source_label + "   /   " + mode_text;
+        const PanelLayout m = layout_panel("SYSTEM", fields, footer, ui);
+        draw_panel(frame, cv::Point(margin, frame.rows - m.size.height - margin), "SYSTEM", fields, footer, accent,
+                   text_color, dim_text, ui);
+    }
+
+    // --- Bottom-right: detection summary.
+    {
+        const std::vector<PanelField> fields = {
+            {"HUMANS", std::to_string(stats.detected_people)},
+            {"BEST", std::to_string(static_cast<int>(std::round(stats.best_person_score * 100))) + "%"},
+        };
+        const PanelLayout m = layout_panel("DETECTION", fields, "", ui);
+        draw_panel(frame, cv::Point(frame.cols - m.size.width - margin, frame.rows - m.size.height - margin),
+                   "DETECTION", fields, "", accent, text_color, dim_text, ui);
     }
 
     // --- Fire / hotspot warning banner (top-center) ---
     if (stats.fire_warning) {
         const cv::Scalar fire_accent(40, 120, 255);
         const std::string warn = cv::format("FIRE / HOTSPOT  %.0fC", stats.thermal_max_c);
-        const double fs = 0.9 * ui;
-        int baseline = 0;
-        const cv::Size ts = cv::getTextSize(warn, cv::FONT_HERSHEY_SIMPLEX, fs, 2, &baseline);
+        const cv::Size ts = measure_text(warn, kTextBanner, ui, true);
         const cv::Rect banner((frame.cols - ts.width) / 2 - static_cast<int>(20 * ui), static_cast<int>(62 * ui),
                               ts.width + static_cast<int>(40 * ui), ts.height + static_cast<int>(24 * ui));
         fill_translucent_rect(frame, banner, cv::Scalar(0, 0, 30), 0.62);
         cv::rectangle(frame, banner, fire_accent, 2, cv::LINE_AA);
-        cv::putText(frame, warn,
-                    cv::Point(banner.x + static_cast<int>(20 * ui), banner.y + ts.height + static_cast<int>(10 * ui)),
-                    cv::FONT_HERSHEY_SIMPLEX, fs, cv::Scalar(60, 200, 255), 2, cv::LINE_AA);
+        draw_text(frame, warn,
+                  cv::Point(banner.x + static_cast<int>(20 * ui), banner.y + ts.height + static_cast<int>(10 * ui)),
+                  kTextBanner, cv::Scalar(60, 200, 255), ui, true);
+    }
+}
+
+void draw_stream_annotations(cv::Mat& frame, const std::vector<StreamAnnotation>& annotations)
+{
+    if (frame.empty() || annotations.empty()) {
+        return;
+    }
+
+    const int w = frame.cols;
+    const int h = frame.rows;
+    auto to_px = [&](float nx, float ny) {
+        return cv::Point(std::max(0, std::min(w - 1, static_cast<int>(std::round(nx * w)))),
+                         std::max(0, std::min(h - 1, static_cast<int>(std::round(ny * h)))));
+    };
+
+    // Commander palette — deliberately distinct from the green HUD and amber
+    // victim boxes: cyan doors, magenta arrows, gold breadcrumb trail.
+    const cv::Scalar door_color(255, 210, 40);   // BGR cyan
+    const cv::Scalar arrow_color(216, 60, 255);  // BGR magenta
+    const cv::Scalar crumb_color(60, 210, 255);  // BGR gold
+    const cv::Scalar shadow(0, 0, 0);
+
+    // Pass 1: draw the connecting trail beneath the breadcrumb markers so the
+    // firefighter can follow the dropped path in order.
+    cv::Point prev_crumb(-1, -1);
+    for (const auto& a : annotations) {
+        if (a.type != StreamAnnotation::Type::Breadcrumb) {
+            continue;
+        }
+        const cv::Point c = to_px(a.x0, a.y0);
+        if (prev_crumb.x >= 0) {
+            cv::line(frame, prev_crumb, c, shadow, 5, cv::LINE_AA);
+            cv::line(frame, prev_crumb, c, crumb_color, 2, cv::LINE_AA);
+        }
+        prev_crumb = c;
+    }
+
+    // Pass 2: markers on top.
+    int crumb_no = 0;
+    for (const auto& a : annotations) {
+        switch (a.type) {
+        case StreamAnnotation::Type::Door: {
+            const cv::Point p0 = to_px(a.x0, a.y0);
+            const cv::Point p1 = to_px(a.x1, a.y1);
+            const cv::Rect box(cv::Point(std::min(p0.x, p1.x), std::min(p0.y, p1.y)),
+                               cv::Point(std::max(p0.x, p1.x) + 1, std::max(p0.y, p1.y) + 1));
+            fill_translucent_rect(frame, box, door_color, 0.18);
+            cv::rectangle(frame, box, shadow, 4, cv::LINE_AA);
+            cv::rectangle(frame, box, door_color, 2, cv::LINE_AA);
+            const double s = std::max(1.0, frame.cols / 1280.0);
+            const cv::Point label(box.x + 4, std::max(18, box.y - static_cast<int>(std::round(9 * s))));
+            draw_text(frame, "DOOR", label, kTextTitle, door_color, s, true);
+            break;
+        }
+        case StreamAnnotation::Type::Arrow: {
+            const cv::Point tail = to_px(a.x0, a.y0);
+            const cv::Point head = to_px(a.x1, a.y1);
+            const double len = cv::norm(head - tail);
+            const double tip = len > 1.0 ? std::min(0.4, 26.0 / len) : 0.3;
+            cv::arrowedLine(frame, tail, head, shadow, 8, cv::LINE_AA, 0, tip);
+            cv::arrowedLine(frame, tail, head, arrow_color, 4, cv::LINE_AA, 0, tip);
+            break;
+        }
+        case StreamAnnotation::Type::Breadcrumb: {
+            ++crumb_no;
+            const cv::Point c = to_px(a.x0, a.y0);
+            // Sized off the frame so the waypoint stays readable at a glance in
+            // smoke — a firefighter must spot it without studying the HUD.
+            const double s = std::max(1.0, frame.cols / 1280.0);
+            const int r = static_cast<int>(std::round(13.0 * s));
+            cv::circle(frame, c, r + 4, shadow, 3, cv::LINE_AA);
+            cv::circle(frame, c, r, shadow, cv::FILLED, cv::LINE_AA);
+            cv::circle(frame, c, r - 2, crumb_color, cv::FILLED, cv::LINE_AA);
+            const std::string num = std::to_string(crumb_no);
+            // Dark digit on the filled gold marker — contrast is already high,
+            // so no outline here either.
+            const cv::Size ts = measure_text(num, kTextLabel, s, true);
+            cv::putText(frame, num, cv::Point(c.x - ts.width / 2, c.y + ts.height / 2), kHudFont, kTextLabel * s,
+                        cv::Scalar(20, 20, 20), text_thickness(kTextLabel * s, true), cv::LINE_AA);
+            break;
+        }
+        }
     }
 }
 

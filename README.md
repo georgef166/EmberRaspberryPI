@@ -120,6 +120,24 @@ Remote viewing: start with `./run.sh --coral --stream`, then open
 `http://<raspberry-pi-ip>:8080/` from another computer on the same network. Use
 `hostname -I` on the Pi to find its LAN IP address.
 
+**Commander console.** The remote page is interactive: pick a tool and mark up the
+live feed. Markup is burned into the shared HUD, so the firefighter sees it too.
+
+| Tool | Use |
+|---|---|
+| **BREADCRUMB** | Click the video to drop numbered waypoints; they auto-connect into a trail |
+| **DOOR** | Drag a box to highlight an opening |
+| **ARROW** | Drag tail-to-head for a directional cue |
+| **UNDO / CLEAR ALL** | Remove the last mark, or wipe all |
+
+> **Password protected.** Because commander markup renders onto the firefighter's
+> helmet display, the console is gated behind a login (default password `admin`).
+> The video and every annotation endpoint return `401` without a valid session.
+> Change it with `--stream-password`, or disable the gate with `--no-stream-auth`.
+> Note the stream is plain HTTP — the password crosses the LAN unencrypted, which is
+> fine for a closed demo network but not for public Wi-Fi. The firefighter's local
+> HUD on the Pi is never gated.
+
 A one-click launcher is provided at `TacticalRescue.desktop`. Double-click and select "Execute".
 
 On launch the app will:
@@ -170,6 +188,8 @@ The CMake configure step prints `Coral Edge TPU support: ENABLED` when `libedget
 --stream-port NUM          Stream HTTP port (default: 8080)
 --stream-fps NUM           Stream frame rate cap (default: 10)
 --stream-quality NUM       Stream JPEG quality 20-95 (default: 75)
+--stream-password PASS     Commander view password (default: admin)
+--no-stream-auth           Disable the commander view password gate
 --hud-scale NUM            HUD element scale factor (default: 3)
 --no-preview               Run capture and inference headless
 --show-detector-input      Show the exact frame passed to the TFLite model

@@ -29,6 +29,7 @@ constexpr int kDefaultStreamPort = 8080;
 constexpr int kDefaultStreamJpegQuality = 75;
 constexpr int kDefaultStreamFps = 10;
 constexpr const char* kDefaultStreamBindAddress = "0.0.0.0";
+constexpr const char* kDefaultStreamPassword = "admin";
 
 enum class DetectorSource {
     AUTO,
@@ -72,6 +73,10 @@ struct Options {
     int stream_jpeg_quality = kDefaultStreamJpegQuality;
     int stream_fps = kDefaultStreamFps;
     std::string stream_bind_address = kDefaultStreamBindAddress;
+    // Commander view auth. The remote console can place markup that is burned
+    // into the firefighter's HUD, so it is gated by default.
+    bool stream_auth_enabled = true;
+    std::string stream_password = kDefaultStreamPassword;
     DetectorSource detector_source = DetectorSource::AUTO;
     TfliteInputMode tflite_input_mode = TfliteInputMode::FUSED;
     bool edgetpu = false; // Run TFLite inference on the Coral Edge TPU instead of the Pi CPU
@@ -223,7 +228,14 @@ cv::Mat build_pseudo_detector_input(const SharedFrame& lidar_frame, const Option
 DetectionState run_tof_person_detector(const SharedFrame& lidar_frame, DetectorSource source, const Options& opt,
                                        float* best_person_score_out = nullptr);
 
-void draw_person_detection(cv::Mat& frame, const PersonDetection& detection, int index);
+// Maps a source (ToF-resolution) point into the composed 1920x1080 display
+// canvas, matching compose_display_canvas()'s letterbox fit. Exposed so overlays
+// can be drawn at full display resolution instead of being upscaled with the
+// image (which made labels huge and box edges chunky).
+void display_canvas_transform(const cv::Size& source, double& scale, cv::Point& offset);
+
+void draw_person_detection(cv::Mat& frame, const PersonDetection& detection, int index, double scale = 1.0,
+                           const cv::Point& offset = cv::Point(0, 0));
 void draw_thermal_overlay(cv::Mat& frame, const ThermalFrame& thermal, const Options& opt);
 void draw_hud(cv::Mat& frame, const RuntimeStats& stats, const DetectionState& detections, bool detector_enabled,
               int scale);
