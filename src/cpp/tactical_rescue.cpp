@@ -197,8 +197,26 @@ bool parse_args(int argc, char* argv[], Options& opt)
                 << "  --stream-port NUM        Stream HTTP port (default 8080)\n"
                 << "  --stream-fps NUM         Stream frame rate cap (default 10)\n"
                 << "  --stream-quality NUM     Stream JPEG quality 20-95 (default 75)\n"
-                << "  --stream-password PASS   Commander view password (default 'admin')\n"
-                << "  --no-stream-auth         Disable the commander view password gate\n"
+                << "  --stream-password PASS   Commander view password (default 'admin')
+"
+                << "  --no-stream-auth         Disable the commander view password gate
+"
+                << "  --no-ground              Disable ground plane detection and the AR grid
+"
+                << "  --ground-fps NUM         Ground plane fit cadence (default 10)
+"
+                << "  --ground-stride NUM      Depth subsample stride for the fit (default 4)
+"
+                << "  --ground-max-tilt DEG    Max floor tilt vs camera up (default 45)
+"
+                << "  --grid-spacing MM        AR grid cell size (default 500)
+"
+                << "  --grid-extent MM         AR grid half-width (default 3000)
+"
+                << "  --intrinsics FX,FY,CX,CY ToF intrinsics (default 230.5,230.5,120,90)
+"
+                << "  --depth-radial           Depth frame is radial slant range, not Z depth
+"
                 << "  --hud-scale NUM          HUD scale factor\n"
                 << "  --show-detector-input    Show the exact image sent to the ToF detector\n"
                 << "  --no-preview             Run acquisition/inference without UI\n";
@@ -271,6 +289,27 @@ bool parse_args(int argc, char* argv[], Options& opt)
             opt.stream_auth_enabled = false;
         } else if (arg == "--hud-scale") {
             opt.hud_scale = std::max(1, std::atoi(require_value("--hud-scale")));
+        } else if (arg == "--no-ground") {
+            opt.enable_ground_plane = false;
+        } else if (arg == "--ground-fps") {
+            opt.ground_fps = std::max(1, std::atoi(require_value("--ground-fps")));
+        } else if (arg == "--ground-stride") {
+            opt.ground_stride = std::max(1, std::atoi(require_value("--ground-stride")));
+        } else if (arg == "--ground-max-tilt") {
+            opt.ground_max_tilt_deg = static_cast<float>(std::atof(require_value("--ground-max-tilt")));
+        } else if (arg == "--grid-spacing") {
+            opt.grid_spacing_mm = static_cast<float>(std::atof(require_value("--grid-spacing")));
+        } else if (arg == "--grid-extent") {
+            opt.grid_half_width_mm = static_cast<float>(std::atof(require_value("--grid-extent")));
+        } else if (arg == "--depth-radial") {
+            opt.depth_is_radial = true;
+        } else if (arg == "--intrinsics") {
+            const char* value = require_value("--intrinsics");
+            if (std::sscanf(value, "%f,%f,%f,%f", &opt.fx, &opt.fy, &opt.cx, &opt.cy) != 4) {
+                std::cerr << "Expected --intrinsics FX,FY,CX,CY" << std::endl;
+                std::exit(2);
+            }
+            opt.intrinsics_explicit = true;
         } else if (arg == "--show-detector-input") {
             opt.show_detector_input = true;
         } else if (arg == "--no-preview") {
@@ -342,6 +381,7 @@ int main(int argc, char* argv[])
     options.max_depth_mm = std::min(options.max_depth_mm, actual_range > 0 ? actual_range : options.range_mm);
 
     auto info = tof.getCameraInfo();
+    scale_intrinsics_to_frame(options, info.width, info.height);
     std::cout << "Tactical rescue feed active at " << info.width << "x" << info.height << " range " << actual_range
               << "mm" << std::endl;
 
@@ -418,6 +458,8 @@ int main(int argc, char* argv[])
     std::mutex detector_input_mutex;
     ThermalFrame latest_thermal;
     std::mutex thermal_mutex;
+    GroundPlaneState latest_ground;
+    std::mutex ground_mutex;
     RuntimeStats stats;
     std::mutex stats_mutex;
     std::atomic<bool> running{true};
@@ -683,6 +725,48 @@ int main(int argc, char* argv[])
         }
     });
 
+    std::thread ground_thread;
+    if (options.enable_ground_plane) {
+        ground_thread = std::thread([&] {
+            GroundPlaneTracker tracker;
+            uint64_t consumed_frame = 0;
+            auto last_fit_started = std::chrono::steady_clock::time_point::min();
+            while (running) {
+                SharedFrame lidar_input;
+                {
+                    std::unique_lock<std::mutex> lock(frame_mutex);
+                    frame_cv.wait(lock, [&] { return !running || published_sequence.load() != consumed_frame; });
+                    if (!running) {
+                        break;
+                    }
+                    lidar_input = latest_frame;
+                }
+
+                if (lidar_input.depth_mm.empty() || lidar_input.sequence == consumed_frame) {
+                    continue;
+                }
+                consumed_frame = lidar_input.sequence;
+
+                const auto now = std::chrono::steady_clock::now();
+                if (last_fit_started != std::chrono::steady_clock::time_point::min()) {
+                    const auto min_period = std::chrono::milliseconds(1000 / std::max(1, options.ground_fps));
+                    if (now - last_fit_started < min_period) {
+                        continue;
+                    }
+                }
+                last_fit_started = now;
+
+                GroundPlaneState state = tracker.update(lidar_input, options);
+                state.source_sequence = lidar_input.sequence;
+                state.fit_ms = std::chrono::duration<double, std::milli>(
+                                   std::chrono::steady_clock::now() - now).count();
+
+                std::lock_guard<std::mutex> lock(ground_mutex);
+                latest_ground = state;
+            }
+        });
+    }
+
     if (!options.no_preview) {
         cv::namedWindow("tactical_rescue", cv::WINDOW_NORMAL);
         cv::setWindowProperty("tactical_rescue", cv::WND_PROP_FULLSCREEN, cv::WINDOW_FULLSCREEN);
@@ -743,8 +827,18 @@ int main(int argc, char* argv[])
             local_stats = stats;
         }
         cv::Mat display = compose_display_canvas(hud);
+        // Ground plane grid first: it is world geometry and belongs UNDER the
+        // victim boxes, which are the alert layer the operator must never lose.
+        if (options.enable_ground_plane) {
+            GroundPlaneState ground_snapshot;
+            {
+                std::lock_guard<std::mutex> lock(ground_mutex);
+                ground_snapshot = latest_ground;
+            }
+            draw_ground_grid(display, ground_snapshot, frame, compute_canvas_transform(hud.size()), options);
+        }
         // Victim boxes are drawn on the full-resolution canvas, not on the
-        // 240x180 ToF frame — drawing them before the upscale magnified the
+        // 240x180 ToF frame - drawing them before the upscale magnified the
         // label ~6x and turned the outline into chunky blocks.
         if (detections.valid && detections.source_sequence <= frame.sequence) {
             double det_scale = 1.0;
@@ -817,6 +911,9 @@ int main(int argc, char* argv[])
     }
     if (inference_thread.joinable()) {
         inference_thread.join();
+    }
+    if (ground_thread.joinable()) {
+        ground_thread.join();
     }
 
     if (tof.stop()) {

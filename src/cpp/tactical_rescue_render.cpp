@@ -352,19 +352,16 @@ void draw_reference_vitals(cv::Mat& frame, const cv::Rect& rect, int heading, co
 
 } // namespace
 
+// Thin adapter over compute_canvas_transform(). Both names exist because the
+// commander-console work and the AR-grid work arrived at this same letterbox
+// math independently. Keeping a single implementation is not tidiness: if the
+// two copies ever drift, the victim boxes and the ground grid would disagree
+// about where a given floor pixel lands on screen.
 void display_canvas_transform(const cv::Size& source, double& scale, cv::Point& offset)
 {
-    if (source.width <= 0 || source.height <= 0) {
-        scale = 1.0;
-        offset = cv::Point(0, 0);
-        return;
-    }
-    const double fit = std::min(static_cast<double>(kDisplayWidth) / static_cast<double>(source.width),
-                                static_cast<double>(kDisplayHeight) / static_cast<double>(source.height));
-    const int w = std::max(1, static_cast<int>(std::round(source.width * fit)));
-    const int h = std::max(1, static_cast<int>(std::round(source.height * fit)));
-    scale = fit;
-    offset = cv::Point((kDisplayWidth - w) / 2, (kDisplayHeight - h) / 2);
+    const CanvasTransform transform = compute_canvas_transform(source);
+    scale = transform.scale;
+    offset = cv::Point(transform.offset_x, transform.offset_y);
 }
 
 void draw_person_detection(cv::Mat& frame, const PersonDetection& detection, int index, double scale,
@@ -665,6 +662,21 @@ void draw_stream_annotations(cv::Mat& frame, const std::vector<StreamAnnotation>
     }
 }
 
+CanvasTransform compute_canvas_transform(const cv::Size& source_size)
+{
+    CanvasTransform transform;
+    if (source_size.width <= 0 || source_size.height <= 0) {
+        return transform;
+    }
+    transform.scale = std::min(static_cast<double>(kDisplayWidth) / static_cast<double>(source_size.width),
+                               static_cast<double>(kDisplayHeight) / static_cast<double>(source_size.height));
+    const int scaled_width = std::max(1, static_cast<int>(std::round(source_size.width * transform.scale)));
+    const int scaled_height = std::max(1, static_cast<int>(std::round(source_size.height * transform.scale)));
+    transform.offset_x = (kDisplayWidth - scaled_width) / 2;
+    transform.offset_y = (kDisplayHeight - scaled_height) / 2;
+    return transform;
+}
+
 cv::Mat compose_display_canvas(const cv::Mat& source)
 {
     cv::Mat canvas(kDisplayHeight, kDisplayWidth, CV_8UC3, cv::Scalar(0, 0, 0));
@@ -672,19 +684,130 @@ cv::Mat compose_display_canvas(const cv::Mat& source)
         return canvas;
     }
 
-    const double fit_scale = std::min(static_cast<double>(kDisplayWidth) / static_cast<double>(source.cols),
-                                      static_cast<double>(kDisplayHeight) / static_cast<double>(source.rows));
-    const int scaled_width = std::max(1, static_cast<int>(std::round(source.cols * fit_scale)));
-    const int scaled_height = std::max(1, static_cast<int>(std::round(source.rows * fit_scale)));
+    const CanvasTransform transform = compute_canvas_transform(source.size());
+    const int scaled_width = std::max(1, static_cast<int>(std::round(source.cols * transform.scale)));
+    const int scaled_height = std::max(1, static_cast<int>(std::round(source.rows * transform.scale)));
     cv::Mat resized;
-    const int interp = fit_scale >= 1.0 ? cv::INTER_NEAREST : cv::INTER_AREA;
+    const int interp = transform.scale >= 1.0 ? cv::INTER_NEAREST : cv::INTER_AREA;
     cv::resize(source, resized, cv::Size(scaled_width, scaled_height), 0.0, 0.0, interp);
-
-    const int offset_x = (kDisplayWidth - scaled_width) / 2;
-    const int offset_y = (kDisplayHeight - scaled_height) / 2;
-    resized.copyTo(canvas(cv::Rect(offset_x, offset_y, scaled_width, scaled_height)));
+    resized.copyTo(canvas(cv::Rect(transform.offset_x, transform.offset_y, scaled_width, scaled_height)));
 
     return canvas;
+}
+
+void draw_ground_grid(cv::Mat& canvas, const GroundPlaneState& ground, const SharedFrame& lidar_frame,
+                      const CanvasTransform& transform, const Options& opt)
+{
+    if (!opt.enable_ground_plane || !ground.plane.valid || canvas.empty() || lidar_frame.depth_mm.empty()) {
+        return;
+    }
+
+    // Build an orthonormal basis ON the floor: n up, forward, right. The grid is
+    // laid out in (lateral, forward) plane coordinates and then pushed through
+    // the pinhole model, so perspective falls out for free.
+    const cv::Vec3f n = ground.plane.normal;
+    cv::Vec3f forward = cv::Vec3f(0.0f, 0.0f, 1.0f) - n[2] * n;   // camera +Z projected onto the plane
+    if (cv::norm(forward) < 1.0e-2) {
+        // Operator looking almost straight down: +Z is parallel to the normal and
+        // its projection vanishes. Use the camera's own down axis instead.
+        forward = cv::Vec3f(0.0f, 1.0f, 0.0f) - n[1] * n;
+    }
+    const double forward_len = cv::norm(forward);
+    if (forward_len < 1.0e-6) {
+        return;
+    }
+    forward /= static_cast<float>(forward_len);
+    const cv::Vec3f right = forward.cross(n);
+    const cv::Vec3f origin = -ground.plane.d * n;   // floor point directly beneath the operator
+
+    const float spacing = std::max(100.0f, opt.grid_spacing_mm);
+    const float half_width = std::max(spacing, opt.grid_half_width_mm);
+    const float near_mm = std::max(150.0f, opt.grid_near_mm);
+    const float far_mm =
+        std::max(near_mm + spacing, std::min(opt.grid_far_mm, static_cast<float>(opt.max_depth_mm)));
+    const float step = std::max(60.0f, opt.grid_segment_mm);
+    const float fade_span = std::max(1.0f, far_mm - near_mm);
+
+    // Same green the rest of the HUD uses (tactical_rescue_render.cpp accent),
+    // dimmed while we are coasting on a stale fit so a soft lock reads as soft.
+    const cv::Scalar grid_color(74, 255, 158);
+    const double state_gain = ground.stale ? 0.45 : 1.0;
+
+    const cv::Mat valid_mask = build_geometry_mask(lidar_frame.depth_mm, lidar_frame.confidence, opt);
+    const cv::Rect depth_rect(0, 0, lidar_frame.depth_mm.cols, lidar_frame.depth_mm.rows);
+    int segment_budget = kMaxGridSegments;
+
+    auto to_camera = [&](float lateral, float forward_mm) {
+        return cv::Point3f(origin[0] + lateral * right[0] + forward_mm * forward[0],
+                           origin[1] + lateral * right[1] + forward_mm * forward[1],
+                           origin[2] + lateral * right[2] + forward_mm * forward[2]);
+    };
+
+    // A grid vertex is hidden when the ToF sees something closer along that ray.
+    // Where depth is INVALID we draw it: an unknown pixel (smoke, no return) must
+    // not punch holes in the navigation grid — that is exactly where the operator
+    // needs it most.
+    auto is_occluded = [&](const cv::Point3f& p, const cv::Point2f& px) {
+        const int u = cvRound(px.x);
+        const int v = cvRound(px.y);
+        if (!depth_rect.contains(cv::Point(u, v))) {
+            return true;
+        }
+        if (valid_mask.at<uint8_t>(v, u) == 0) {
+            return false;
+        }
+        const float measured = lidar_frame.depth_mm.at<float>(v, u);
+        const float expected =
+            opt.depth_is_radial ? static_cast<float>(cv::norm(cv::Vec3f(p.x, p.y, p.z))) : p.z;
+        return measured < expected - opt.grid_occlusion_tol_mm;
+    };
+
+    // Walk a grid line in 3D and emit only its visible, in-front-of-us pieces.
+    // A straight 3D line does project to a straight 2D line under a pinhole, so
+    // this tessellation exists for near-plane clipping and occlusion, not curvature.
+    auto emit_line = [&](float lat0, float fwd0, float lat1, float fwd1, bool emphasise) {
+        const float length = std::hypot(lat1 - lat0, fwd1 - fwd0);
+        const int steps = std::max(1, static_cast<int>(std::ceil(length / step)));
+        bool have_previous = false;
+        cv::Point2f previous_canvas;
+
+        for (int i = 0; i <= steps && segment_budget > 0; ++i) {
+            const float t = static_cast<float>(i) / static_cast<float>(steps);
+            const cv::Point3f p = to_camera(lat0 + (lat1 - lat0) * t, fwd0 + (fwd1 - fwd0) * t);
+
+            cv::Point2f px;
+            if (!project_point(p, opt, px) || is_occluded(p, px)) {
+                have_previous = false;
+                continue;
+            }
+
+            const cv::Point2f canvas_px = transform.map(px);
+            if (have_previous) {
+                const float depth_t = clamp01((p.z - near_mm) / fade_span);
+                const double gain =
+                    state_gain * (1.0 - 0.72 * static_cast<double>(depth_t)) * (emphasise ? 1.0 : 0.72);
+                // Sub-pixel endpoints (1/8 px): stops the grid crawling as it slides.
+                constexpr int kShift = 3;
+                constexpr float kSubPixel = static_cast<float>(1 << kShift);
+                const cv::Point a(cvRound(previous_canvas.x * kSubPixel), cvRound(previous_canvas.y * kSubPixel));
+                const cv::Point b(cvRound(canvas_px.x * kSubPixel), cvRound(canvas_px.y * kSubPixel));
+                cv::line(canvas, a, b, grid_color * gain, depth_t < 0.45f ? 2 : 1, cv::LINE_AA, kShift);
+                --segment_budget;
+            }
+            previous_canvas = canvas_px;
+            have_previous = true;
+        }
+    };
+
+    // Lines running away from the operator; the centre line is drawn brighter as
+    // a heading reference.
+    for (float lateral = -half_width; lateral <= half_width + 1.0f; lateral += spacing) {
+        emit_line(lateral, near_mm, lateral, far_mm, std::fabs(lateral) < 1.0f);
+    }
+    // Cross lines at constant range.
+    for (float forward_mm = near_mm; forward_mm <= far_mm + 1.0f; forward_mm += spacing) {
+        emit_line(-half_width, forward_mm, half_width, forward_mm, false);
+    }
 }
 
 } // namespace tactical_rescue

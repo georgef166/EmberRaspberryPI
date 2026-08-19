@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -30,6 +31,20 @@ constexpr int kDefaultStreamJpegQuality = 75;
 constexpr int kDefaultStreamFps = 10;
 constexpr const char* kDefaultStreamBindAddress = "0.0.0.0";
 constexpr const char* kDefaultStreamPassword = "admin";
+
+// --- Arducam ToF pinhole intrinsics (240x180 native, ~55 deg HFOV) ---
+// Treated as a reference calibration at the resolution below; scale_intrinsics_to_frame()
+// rescales them at startup if the sensor reports something else, so nothing here
+// re-introduces the hardcoded frame size the capture path carefully avoids.
+constexpr float kIntrinsicsRefWidth = 240.0f;
+constexpr float kIntrinsicsRefHeight = 180.0f;
+constexpr float kDefaultFx = 230.5f;
+constexpr float kDefaultFy = 230.5f;
+constexpr float kDefaultCx = 120.0f;
+constexpr float kDefaultCy = 90.0f;
+
+constexpr int kDefaultGroundFps = 10;
+constexpr int kMaxGridSegments = 1400;  // hard cap on cv::line calls per rendered frame
 
 enum class DetectorSource {
     AUTO,
@@ -98,6 +113,35 @@ struct Options {
     float victim_temp_min_c = 26.0f;   // Warm-body band: lower bound (people through smoke)
     float victim_temp_max_c = 45.0f;   // Warm-body band: upper bound (above => fire, not a person)
     float thermal_overlay_alpha = 0.45f;
+    // --- Ground plane detection / AR navigation grid ---
+    bool enable_ground_plane = true;
+    // Arducam DEPTH_FRAME is assumed to be perpendicular (Z) depth. If the unit
+    // emits radial slant range instead, pass --depth-radial: at 55 deg HFOV the
+    // frame corners run ~20% long, which bows a flat floor and starves the fit.
+    bool depth_is_radial = false;
+    bool intrinsics_explicit = false;
+    float fx = kDefaultFx;
+    float fy = kDefaultFy;
+    float cx = kDefaultCx;
+    float cy = kDefaultCy;
+    int ground_fps = kDefaultGroundFps;
+    int ground_stride = 4;                 // 240x180 at stride 4 -> ~2700 candidate points
+    int ground_iterations = 64;
+    int ground_min_inliers = 220;
+    float ground_inlier_mm = 30.0f;        // base band; 1% of range is added on top
+    float ground_min_inlier_ratio = 0.12f;
+    float ground_max_tilt_deg = 45.0f;     // rejects walls (~90 deg), survives a head-down operator
+    float ground_min_height_mm = 500.0f;   // crouching
+    float ground_max_height_mm = 2300.0f;  // standing, helmet-mounted
+    float ground_smoothing = 0.25f;        // EMA weight on each accepted fit
+    int ground_confirm_frames = 3;         // fits required before the grid is shown
+    int ground_hold_frames = 15;           // ~1.5 s of coasting at 10 Hz before dropping the lock
+    float grid_spacing_mm = 500.0f;
+    float grid_half_width_mm = 3000.0f;
+    float grid_near_mm = 300.0f;
+    float grid_far_mm = 4000.0f;
+    float grid_segment_mm = 200.0f;        // tessellation step: clip + occlusion granularity
+    float grid_occlusion_tol_mm = 150.0f;
     std::string am2302_helper_path = kDefaultAm2302HelperPath;
     std::string tflite_model_path = kDefaultTfliteModelPath;
 };
@@ -128,6 +172,61 @@ struct SharedFrame {
     cv::Mat amplitude;
     uint64_t sequence = 0;
     std::chrono::steady_clock::time_point captured_at;
+};
+
+// A ground plane in ToF camera coordinates: X right, Y DOWN, Z forward, all in
+// millimetres to match depth_mm. Satisfies n.P + d = 0 with |n| = 1 and n oriented
+// up (normal[1] < 0). That orientation makes d the camera's height above the floor,
+// so a single d > 0 test throws out ceilings and a tilt test throws out walls.
+struct GroundPlane {
+    cv::Vec3f normal{0.0f, -1.0f, 0.0f};
+    float d = 0.0f;
+    float height_mm = 0.0f;
+    float tilt_deg = 0.0f;
+    int inlier_count = 0;
+    float inlier_ratio = 0.0f;
+    bool valid = false;
+};
+
+struct GroundPlaneState {
+    GroundPlane plane;
+    uint64_t source_sequence = 0;
+    bool stale = false;   // coasting on the last good fit; the grid is drawn dimmed
+    double fit_ms = 0.0;
+};
+
+// Owns the RANSAC scratch buffers, the RNG, and the temporal filter. Exactly one
+// instance lives on the ground thread. Deliberately NOT function-local statics —
+// the existing detection trackers use those and are only accidentally thread-safe.
+class GroundPlaneTracker {
+public:
+    GroundPlaneState update(const SharedFrame& lidar_frame, const Options& opt);
+
+private:
+    std::mt19937 rng_{0xE13E2Du};
+    std::vector<cv::Point3f> points_;
+    std::vector<int> seeds_;
+    std::vector<int> all_indices_;
+    std::vector<int> inliers_;
+    GroundPlane smoothed_;
+    int confirm_hits_ = 0;
+    int miss_frames_ = 0;
+};
+
+// The letterbox mapping compose_display_canvas() applies when it blits the scene
+// image into the 1920x1080 canvas. For 240x180 this is scale 6.0, offset (240, 0).
+// Exposed so 3D geometry can be rasterised directly at canvas resolution instead
+// of being nearest-neighbour upscaled with the scene.
+struct CanvasTransform {
+    double scale = 1.0;
+    int offset_x = 0;
+    int offset_y = 0;
+
+    cv::Point2f map(const cv::Point2f& source_px) const
+    {
+        return cv::Point2f(static_cast<float>(offset_x + source_px.x * scale),
+                           static_cast<float>(offset_y + source_px.y * scale));
+    }
 };
 
 // One MLX90640 readout: a 32x24 grid of per-pixel temperatures in degrees C,
@@ -242,5 +341,15 @@ void draw_thermal_overlay(cv::Mat& frame, const ThermalFrame& thermal, const Opt
 void draw_hud(cv::Mat& frame, const RuntimeStats& stats, const DetectionState& detections, bool detector_enabled,
               int scale);
 cv::Mat compose_display_canvas(const cv::Mat& source);
+
+void scale_intrinsics_to_frame(Options& opt, int width, int height);
+cv::Point3f unproject_pixel(float u, float v, float depth_mm, const Options& opt);
+bool project_point(const cv::Point3f& camera_point, const Options& opt, cv::Point2f& out_px);
+bool ray_plane_intersect(const GroundPlane& plane, float u, float v, const Options& opt,
+                         cv::Point3f& out_point);
+
+CanvasTransform compute_canvas_transform(const cv::Size& source_size);
+void draw_ground_grid(cv::Mat& canvas, const GroundPlaneState& ground, const SharedFrame& lidar_frame,
+                      const CanvasTransform& transform, const Options& opt);
 
 } // namespace tactical_rescue
