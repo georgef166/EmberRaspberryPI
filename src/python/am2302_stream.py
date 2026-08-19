@@ -4,7 +4,12 @@ import argparse
 import sys
 import time
 
-import lgpio
+from typing import Any
+
+try:
+    import lgpio
+except ImportError:  # dev box without the hardware lib: enough for --selfcheck
+    lgpio: Any = type("lgpio", (), {"error": RuntimeError})
 
 DHTXX = 2
 
@@ -87,12 +92,19 @@ class DHTSensor:
             if self._bits >= 30:
                 self._decode()
 
-    def _trigger(self):
+    def _free(self):
         try:
             lgpio.gpio_free(self._chip, self._gpio)
         except Exception:
             pass
-        lgpio.gpio_claim_output(self._chip, self._gpio, 0)
+
+    def _trigger(self):
+        self._free()
+        try:
+            lgpio.gpio_claim_output(self._chip, self._gpio, 0)
+        except Exception:
+            self._free()  # leave the line released so the next retry starts clean
+            raise
         time.sleep(0.001)
         self._bits = 0
         self._code = 0
@@ -109,6 +121,21 @@ class DHTSensor:
         return self._status, self._temperature, self._humidity
 
 
+def stream(sensor, interval):
+    while True:
+        try:
+            status, temperature_c, humidity_percent = sensor.read()
+            label = STATUS_LABELS.get(status, str(status))
+            if status == DHT_GOOD:
+                print(f"{label},{temperature_c:.1f},{humidity_percent:.1f}", flush=True)
+            else:
+                print(f"{label},,", flush=True)
+        except Exception as exc:  # a transient GPIO conflict at boot must not kill the helper
+            print("ERROR,,", flush=True)
+            print(str(exc), file=sys.stderr)
+        time.sleep(max(0.5, interval))
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--gpio", type=int, default=4)
@@ -120,14 +147,7 @@ def main():
     sensor = DHTSensor(chip, args.gpio, model=DHTXX)
 
     try:
-        while True:
-            status, temperature_c, humidity_percent = sensor.read()
-            label = STATUS_LABELS.get(status, str(status))
-            if status == DHT_GOOD:
-                print(f"{label},{temperature_c:.1f},{humidity_percent:.1f}", flush=True)
-            else:
-                print(f"{label},,", flush=True)
-            time.sleep(max(0.5, args.interval))
+        stream(sensor, args.interval)
     except KeyboardInterrupt:
         pass
     finally:
@@ -135,7 +155,33 @@ def main():
         lgpio.gpiochip_close(chip)
 
 
+def _selfcheck():
+    import contextlib
+    import io
+
+    class Fake:
+        n = 0
+
+        def read(self):
+            Fake.n += 1
+            if Fake.n > 2:
+                raise KeyboardInterrupt
+            raise lgpio.error("GPIO busy")
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+        try:
+            stream(Fake(), 0.0)
+        except KeyboardInterrupt:
+            pass
+    assert out.getvalue().count("ERROR,,") == 2, out.getvalue()
+    print("selfcheck ok")
+
+
 if __name__ == "__main__":
+    if "--selfcheck" in sys.argv:
+        _selfcheck()
+        sys.exit(0)
     try:
         main()
     except Exception as exc:

@@ -51,7 +51,9 @@ enum class TfliteInputMode {
 constexpr int kThermalWidth = 32;
 constexpr int kThermalHeight = 24;
 constexpr int kDefaultThermalAddress = 0x33;
-constexpr int kDefaultThermalRefreshHz = 8;
+// Subpage rate: a full 32x24 grid takes two subpages, so 4 Hz = 2 full frames/s.
+// Measured on the bit-banged bus: 29% duty, 0 deadline misses in 120 reads.
+constexpr int kDefaultThermalRefreshHz = 4;
 
 struct Options {
     int device = 0;

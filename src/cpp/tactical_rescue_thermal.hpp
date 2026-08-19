@@ -28,6 +28,17 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+// Is a sensor ambient (die) temperature physically possible? A false here means
+// the frame's calibration inputs are garbage and the grid must be discarded.
+bool thermal_ta_plausible(float ta);
+
+// How long to sleep before the next read() at the given subpage refresh rate,
+// so the vendor's untimed busy-poll does not burn a core waiting.
+int thermal_read_delay_ms(int refresh_hz);
+
+// Asserts the two above. Run: ./tactical_rescue --selfcheck
+void thermal_selfcheck();
+
 // Warm-body victim detection from a thermal frame. Thresholds the configured
 // human temperature band, extracts connected blobs, maps each into the ToF
 // image space, and depth-validates it against the live ToF frame. This is the

@@ -185,7 +185,7 @@ bool parse_args(int argc, char* argv[], Options& opt)
                 << "  --person-class NUM       Model output index for 'person' (default 1; Coral default 0)\n"
                 << "  --no-thermal             Disable the MLX90640 thermal overlay/detector\n"
                 << "  --thermal-address HEX    MLX90640 I2C address (default 0x33)\n"
-                << "  --thermal-refresh HZ     MLX90640 refresh rate: 1|2|4|8|16|32|64 (default 8)\n"
+                << "  --thermal-refresh HZ     MLX90640 subpage rate, 1|2|4|8 (default 4; two subpages per grid)\n"
                 << "  --emissivity FLOAT       Thermal emissivity (default 0.95)\n"
                 << "  --fire-temp C            Hotspot/fire warning threshold in C (default 60)\n"
                 << "  --victim-temp-min C      Warm-body band lower bound (default 26)\n"
@@ -240,7 +240,9 @@ bool parse_args(int argc, char* argv[], Options& opt)
         } else if (arg == "--thermal-address") {
             opt.thermal_address = static_cast<int>(std::strtol(require_value("--thermal-address"), nullptr, 0));
         } else if (arg == "--thermal-refresh") {
-            opt.thermal_refresh_hz = std::max(1, std::atoi(require_value("--thermal-refresh")));
+            // Capped at 8: above that the bus misses deadlines and a torn frame
+            // reads as spurious extreme pixels, i.e. a false fire warning.
+            opt.thermal_refresh_hz = std::max(1, std::min(8, std::atoi(require_value("--thermal-refresh"))));
         } else if (arg == "--emissivity") {
             opt.thermal_emissivity = std::atof(require_value("--emissivity"));
         } else if (arg == "--fire-temp") {
@@ -273,6 +275,10 @@ bool parse_args(int argc, char* argv[], Options& opt)
             opt.show_detector_input = true;
         } else if (arg == "--no-preview") {
             opt.no_preview = true;
+        } else if (arg == "--selfcheck") {
+            // Dev-only, needs no hardware: asserts the thermal pure helpers and quits.
+            thermal_selfcheck();
+            return false;
         } else {
             std::cerr << "Unknown argument: " << arg << std::endl;
             return false;
@@ -353,7 +359,7 @@ int main(int argc, char* argv[])
     const bool tflite_available =
         tflite_model_present && tflite_detector.load(options.tflite_model_path, options.edgetpu);
     if (options.edgetpu && !tflite_available) {
-        std::cerr << "[Coral] Edge TPU detector unavailable; AUTO mode will fall back to thermal/ToF heuristics."
+        std::cerr << "[Coral] Edge TPU detector unavailable; AUTO mode will fall back to the ToF heuristic."
                   << std::endl;
     }
 
@@ -374,15 +380,11 @@ int main(int argc, char* argv[])
     } else if (options.detector_source == DetectorSource::PSEUDO) {
         active_detector_source = DetectorSource::PSEUDO;
     } else if (options.detector_source == DetectorSource::AUTO) {
-        // AUTO preference: TFLite (Coral/CPU) when a model is loaded, else the
-        // thermal warm-body detector when the MLX90640 is present, else the CV heuristic.
-        if (tflite_available) {
-            active_detector_source = DetectorSource::TFLITE;
-        } else if (thermal_available) {
-            active_detector_source = DetectorSource::THERMAL;
-        } else {
-            active_detector_source = DetectorSource::CONFIDENCE;
-        }
+        // AUTO preference: TFLite (Coral/CPU) when a model is loaded, else the CV
+        // heuristic. Thermal is deliberately NOT in this chain — it scores blobs
+        // relative to the grid mean, so in a hot room (the fire case) it returns
+        // zero detections. Still selectable with --detector-source thermal.
+        active_detector_source = tflite_available ? DetectorSource::TFLITE : DetectorSource::CONFIDENCE;
     } else {
         active_detector_source = DetectorSource::AMPLITUDE;
     }
@@ -520,6 +522,12 @@ int main(int argc, char* argv[])
                 }
             }
 
+            if (running) {
+                std::lock_guard<std::mutex> lock(stats_mutex);
+                stats.ambient_status = "ERROR";
+                stats.ambient_valid = false;
+            }
+
             stop_helper_process(helper);
         });
     }
@@ -527,11 +535,28 @@ int main(int argc, char* argv[])
     std::thread thermal_thread;
     if (thermal_available) {
         thermal_thread = std::thread([&] {
+            const auto read_delay = std::chrono::milliseconds(thermal_read_delay_ms(options.thermal_refresh_hz));
             while (running) {
+                // Wait out most of the subpage period here; without this the
+                // vendor's untimed busy-poll inside read() eats a whole core.
+                std::this_thread::sleep_for(read_delay);
+
                 ThermalFrame local;
                 if (!thermal_cam.read(local)) {
-                    std::lock_guard<std::mutex> lock(stats_mutex);
-                    stats.thermal_status = "ERROR";
+                    // Drop the last grid as well, or the overlay and the FIRE
+                    // banner keep painting a dead sensor's final frame forever.
+                    {
+                        std::lock_guard<std::mutex> lock(thermal_mutex);
+                        latest_thermal.valid = false;
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(stats_mutex);
+                        stats.thermal_status = "ERROR";
+                        stats.thermal_valid = false;
+                        stats.fire_warning = false;
+                    }
+                    // Sleep outside the locks: stats_mutex is contended by the
+                    // capture, ambient, inference and render loops.
                     std::this_thread::sleep_for(std::chrono::milliseconds(50));
                     continue;
                 }

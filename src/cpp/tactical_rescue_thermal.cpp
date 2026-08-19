@@ -26,6 +26,10 @@
 #include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <limits>
+
+#undef NDEBUG // compile.sh builds Release, which would strip thermal_selfcheck()'s asserts
+#include <cassert>
 
 #include <opencv2/imgproc.hpp>
 
@@ -41,6 +45,9 @@ namespace {
 
 #ifdef EMBER_HAVE_MLX90640
 // Map a refresh rate in Hz to the MLX90640 control-register code (0..7).
+// Anything not listed here silently becomes 8 Hz. --thermal-refresh is clamped
+// to 1..8 anyway: above 8 the bit-banged bus misses deadlines and GetFrameData
+// tears the frame (spurious extreme pixels => false fire warning).
 uint8_t refresh_rate_code(int hz)
 {
     switch (hz) {
@@ -51,12 +58,44 @@ uint8_t refresh_rate_code(int hz)
     case 16: return 0x05;
     case 32: return 0x06;
     case 64: return 0x07;
-    default: return 0x04; // 8 Hz — stable on the Pi 4B I2C bus at 1 MHz
+    default: return 0x04;
     }
 }
 #endif
 
 } // namespace
+
+bool thermal_ta_plausible(float ta)
+{
+    // MLX90640 die-temperature spec range. Rejects cold-start NaN, the
+    // divide-by-zero from --emissivity 0, and the aux-word garbage that gets
+    // through when ValidateAuxData fails without copying — each of which
+    // otherwise yields a plausible-looking but fictional grid.
+    return std::isfinite(ta) && ta >= -40.0f && ta <= 125.0f;
+}
+
+int thermal_read_delay_ms(int refresh_hz)
+{
+    // Sleep out most of the subpage period instead of leaving the vendor's
+    // untimed busy-poll to spin it: 99.6% -> 48.1% of a core, identical data.
+    // The 70 ms slack covers the I2C transfer plus poll jitter.
+    return std::max(0, 1000 / std::max(1, refresh_hz) - 70);
+}
+
+void thermal_selfcheck()
+{
+    assert(thermal_ta_plausible(25.0f));
+    assert(!thermal_ta_plausible(std::numeric_limits<float>::quiet_NaN()));
+    assert(!thermal_ta_plausible(std::numeric_limits<float>::infinity()));
+    assert(!thermal_ta_plausible(-41.0f));
+    assert(!thermal_ta_plausible(126.0f));
+
+    assert(thermal_read_delay_ms(4) == 180);  // default: 250 ms subpage period
+    assert(thermal_read_delay_ms(8) == 55);
+    assert(thermal_read_delay_ms(16) == 0);   // period < slack, never negative
+    assert(thermal_read_delay_ms(0) == 930);  // no divide by zero
+    std::cout << "thermal selfcheck ok" << std::endl;
+}
 
 struct Mlx90640Camera::Impl {
     bool open = false;
@@ -79,10 +118,12 @@ bool Mlx90640Camera::open(const Options& opt)
     impl_->emissivity = opt.thermal_emissivity;
 
     MLX90640_I2CInit();
-    MLX90640_I2CFreqSet(1000); // 1 MHz — required for reliable >=8 Hz reads on the Pi
+    // Advisory only: Linux has no per-client bus-speed ioctl, and this sensor is
+    // on a bit-banged bus whose clock is fixed at probe by i2c_gpio_delay_us.
+    MLX90640_I2CFreqSet(1000);
 
     uint16_t eeprom[832];
-    if (MLX90640_DumpEEPROM(impl_->address, eeprom) != 0) {
+    if (MLX90640_DumpEE(impl_->address, eeprom) != 0) {
         std::cerr << "[MLX90640] EEPROM read failed at 0x" << std::hex << static_cast<int>(impl_->address)
                   << std::dec << " — check wiring and that I2C is enabled (raspi-config)." << std::endl;
         return false;
@@ -121,13 +162,16 @@ bool Mlx90640Camera::read(ThermalFrame& out)
         return false;
     }
 
-    uint16_t frame[834];
-    if (MLX90640_GetFrameData(impl_->address, frame) < 0) {
+    uint16_t frame[834] = {};
+    if (MLX90640_GetFrameData(impl_->address, frame) < 0) { // returns the subpage index (0|1) on success
         return false;
     }
 
     // Reflected temperature estimate: ambient minus ~8 C (Melexis reference value).
     const float ta = MLX90640_GetTa(frame, &impl_->params);
+    if (!thermal_ta_plausible(ta)) {
+        return false;
+    }
     const float tr = ta - 8.0f;
     MLX90640_CalculateTo(frame, &impl_->params, impl_->emissivity, tr, impl_->to);
 

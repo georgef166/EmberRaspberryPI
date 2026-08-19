@@ -79,7 +79,8 @@ cv::Mat build_amplitude_visibility_base(const cv::Mat& amplitude)
     shifted.convertTo(amp_u8, CV_8U, 255.0f / span);
     cv::medianBlur(amp_u8, amp_u8, 3);
 
-    static cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(1.4, cv::Size(8, 8));
+    // CLAHE_Impl::apply is stateful; this runs on both the render and inference threads.
+    thread_local cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(1.4, cv::Size(8, 8));
     cv::Mat contrast;
     clahe->apply(amp_u8, contrast);
 

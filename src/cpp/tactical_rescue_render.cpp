@@ -437,10 +437,12 @@ void draw_thermal_overlay(cv::Mat& frame, const ThermalFrame& thermal, const Opt
         return;
     }
 
-    // Map temperature to a fixed [warm-body floor, fire threshold] display range
-    // so the colours stay stable frame-to-frame. Cold structure (below the floor)
-    // is left untinted so the wireframe geometry still reads through.
-    const float lo = opt.victim_temp_min_c;
+    // Map temperature to a [warm-body floor, fire threshold] display range so the
+    // colours stay stable frame-to-frame. Cold structure (below the floor) is left
+    // untinted so the wireframe geometry still reads through. The floor tracks the
+    // room: a fixed 26 C tints every pixel in any room warmer than that, washing
+    // out the depth geometry the operator navigates by.
+    const float lo = std::max(opt.victim_temp_min_c, thermal.mean_c + 2.0f);
     const float hi = std::max(opt.fire_temp_c, lo + 1.0f);
     const float scale = 1.0f / (hi - lo);
 
@@ -482,7 +484,6 @@ void draw_hud(cv::Mat& frame, const RuntimeStats& stats, const DetectionState& d
                                       : "DETECTOR OFF";
 
     const int margin = static_cast<int>(std::round(22 * ui));
-    const int gap = static_cast<int>(std::round(12 * ui));
 
     // --- Top-left: identity. Same panel grammar as the sensor readouts, with
     // the wordmark occupying the "value" slot.
@@ -491,41 +492,53 @@ void draw_hud(cv::Mat& frame, const RuntimeStats& stats, const DetectionState& d
         draw_panel(frame, cv::Point(margin, margin), "IGNISXR", fields, "", accent, text_color, dim_text, ui);
     }
 
-    // --- Top-right: ambient, then thermal stacked beneath it.
-    int right_y = margin;
-    if (stats.ambient_enabled) {
-        std::vector<PanelField> fields;
-        std::string footer = "STATUS " + stats.ambient_status;
-        if (stats.ambient_valid) {
-            fields.push_back({"TEMP", cv::format("%.1fC", stats.ambient_temperature_c)});
-            fields.push_back({"HUMIDITY", cv::format("%.1f%%", stats.ambient_humidity_percent)});
-            // ASCII only — the Hershey fonts have no glyph for U+00B7 and render
-            // it as "??".
-            footer += cv::format("   /   AGE %.1fs", stats.ambient_age_s);
-        } else {
-            // No reading yet: title + status only, rather than a placeholder value.
-            footer = "WAITING FOR SENSOR";
-        }
-        const PanelLayout m = layout_panel("AM2302", fields, footer, ui);
-        draw_panel(frame, cv::Point(frame.cols - m.size.width - margin, right_y), "AM2302", fields, footer, accent,
-                   text_color, dim_text, ui);
-        right_y += m.size.height + gap;
-    }
-
-    if (stats.thermal_enabled) {
+    // --- Top-right: one temperature panel fed by both sensors. The thermal
+    // camera owns the temperature readout; the AM2302 contributes humidity and
+    // only lends its own temp when thermal has nothing valid.
+    if (stats.thermal_enabled || stats.ambient_enabled) {
         const cv::Scalar fire_accent(40, 120, 255); // BGR orange-red
-        const cv::Scalar panel_accent = stats.fire_warning ? fire_accent : accent;
+        // Same age gate as the banner below: a wedged thermal thread never
+        // reaches its error path, so staleness is the only tell.
+        const bool fire = stats.fire_warning && stats.thermal_age_s < 2.0;
+
         std::vector<PanelField> fields;
-        std::string footer = "STATUS " + stats.thermal_status;
         if (stats.thermal_valid) {
             fields.push_back({"MAX", cv::format("%.1fC", stats.thermal_max_c)});
             fields.push_back({"MEAN", cv::format("%.1fC", stats.thermal_mean_c)});
-        } else {
-            footer = "WAITING FOR SENSOR";
+        } else if (stats.ambient_valid) {
+            fields.push_back({"TEMP", cv::format("%.1fC", stats.ambient_temperature_c)});
         }
-        const PanelLayout m = layout_panel("MLX90640", fields, footer, ui);
-        draw_panel(frame, cv::Point(frame.cols - m.size.width - margin, right_y), "MLX90640", fields, footer,
-                   panel_accent, stats.fire_warning ? fire_accent : text_color, dim_text, ui);
+        if (stats.ambient_valid) {
+            fields.push_back({"HUMIDITY", cv::format("%.1f%%", stats.ambient_humidity_percent)});
+        }
+
+        // Footer stays terse: layout_panel sizes the panel from the widest of
+        // title/values/footer, so a chatty footer becomes the width driver.
+        // Name a sensor only when it is degraded. ASCII only — the Hershey fonts
+        // have no glyph for U+00B7 and render it as "??".
+        std::string footer;
+        if (fields.empty()) {
+            // No reading from either sensor: status line only, no placeholders.
+            footer = "WAITING FOR SENSOR";
+        } else {
+            if (stats.thermal_enabled && stats.thermal_status != "GOOD") {
+                footer = "THERM " + stats.thermal_status;
+            }
+            if (stats.ambient_enabled && stats.ambient_status != "GOOD") {
+                if (!footer.empty()) {
+                    footer += "   /   ";
+                }
+                footer += "AMB " + stats.ambient_status;
+            }
+            if (footer.empty()) {
+                footer = "STATUS GOOD";
+            }
+            footer += cv::format("   /   AGE %.1fs", stats.thermal_valid ? stats.thermal_age_s : stats.ambient_age_s);
+        }
+
+        const PanelLayout m = layout_panel("TEMP", fields, footer, ui);
+        draw_panel(frame, cv::Point(frame.cols - m.size.width - margin, margin), "TEMP", fields, footer,
+                   fire ? fire_accent : accent, fire ? fire_accent : text_color, dim_text, ui);
     }
 
     // --- Bottom-left: system telemetry.
@@ -553,7 +566,9 @@ void draw_hud(cv::Mat& frame, const RuntimeStats& stats, const DetectionState& d
     }
 
     // --- Fire / hotspot warning banner (top-center) ---
-    if (stats.fire_warning) {
+    // Age-gated: a thermal thread wedged in the vendor's untimed busy-poll never
+    // reaches its error path, so staleness is the only tell left.
+    if (stats.fire_warning && stats.thermal_age_s < 2.0) {
         const cv::Scalar fire_accent(40, 120, 255);
         const std::string warn = cv::format("FIRE / HOTSPOT  %.0fC", stats.thermal_max_c);
         const cv::Size ts = measure_text(warn, kTextBanner, ui, true);
