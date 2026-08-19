@@ -114,7 +114,8 @@ struct Options {
     float victim_temp_max_c = 45.0f;   // Warm-body band: upper bound (above => fire, not a person)
     float thermal_overlay_alpha = 0.45f;
     // --- Ground plane detection / AR navigation grid ---
-    bool enable_ground_plane = true;
+    bool enable_ground_plane = false;  // AR grid is opt-in (--ground) pending bring-up validation: it
+                                       // locks onto non-floor planes in cluttered views
     // Arducam DEPTH_FRAME is assumed to be perpendicular (Z) depth. If the unit
     // emits radial slant range instead, pass --depth-radial: at 55 deg HFOV the
     // frame corners run ~20% long, which bows a flat floor and starves the fit.
@@ -126,7 +127,12 @@ struct Options {
     float cy = kDefaultCy;
     int ground_fps = kDefaultGroundFps;
     int ground_stride = 4;                 // 240x180 at stride 4 -> ~2700 candidate points
-    int ground_iterations = 64;
+    int ground_iterations = 2000;          // RANSAC draws 3 pts/iter, so P(fit) = 1-(1-r^3)^N. On device
+                                           // r lands at 0.12-0.15 => 64 iters only ~13%, matching the observed
+                                           // LOCK->STALE->NONE flicker; 2000 gets ~99%. Fit costs 0.4-1.5 ms
+                                           // against a 100 ms (10 Hz) budget, so 30x still leaves ~65x headroom.
+                                           // A floor-filling view has a far higher r where 64 sufficed - this
+                                           // only buys robustness in marginal/cluttered views.
     int ground_min_inliers = 220;
     float ground_inlier_mm = 30.0f;        // base band; 1% of range is added on top
     float ground_min_inlier_ratio = 0.12f;

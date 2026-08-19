@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <csignal>
 #include <cstdio>
+#include <iomanip>
 #include <iostream>
 #include <mutex>
 #include <sstream>
@@ -197,26 +198,17 @@ bool parse_args(int argc, char* argv[], Options& opt)
                 << "  --stream-port NUM        Stream HTTP port (default 8080)\n"
                 << "  --stream-fps NUM         Stream frame rate cap (default 10)\n"
                 << "  --stream-quality NUM     Stream JPEG quality 20-95 (default 75)\n"
-                << "  --stream-password PASS   Commander view password (default 'admin')
-"
-                << "  --no-stream-auth         Disable the commander view password gate
-"
-                << "  --no-ground              Disable ground plane detection and the AR grid
-"
-                << "  --ground-fps NUM         Ground plane fit cadence (default 10)
-"
-                << "  --ground-stride NUM      Depth subsample stride for the fit (default 4)
-"
-                << "  --ground-max-tilt DEG    Max floor tilt vs camera up (default 45)
-"
-                << "  --grid-spacing MM        AR grid cell size (default 500)
-"
-                << "  --grid-extent MM         AR grid half-width (default 3000)
-"
-                << "  --intrinsics FX,FY,CX,CY ToF intrinsics (default 230.5,230.5,120,90)
-"
-                << "  --depth-radial           Depth frame is radial slant range, not Z depth
-"
+                << "  --stream-password PASS   Commander view password (default 'admin')\n"
+                << "  --no-stream-auth         Disable the commander view password gate\n"
+                << "  --ground                 Enable ground plane detection and the AR grid\n"
+                << "  --no-ground              Disable ground plane detection (the default)\n"
+                << "  --ground-fps NUM         Ground plane fit cadence (default 10)\n"
+                << "  --ground-stride NUM      Depth subsample stride for the fit (default 4)\n"
+                << "  --ground-max-tilt DEG    Max floor tilt vs camera up (default 45)\n"
+                << "  --grid-spacing MM        AR grid cell size (default 500)\n"
+                << "  --grid-extent MM         AR grid half-width (default 3000)\n"
+                << "  --intrinsics FX,FY,CX,CY ToF intrinsics (default 230.5,230.5,120,90)\n"
+                << "  --depth-radial           Depth frame is radial slant range, not Z depth\n"
                 << "  --hud-scale NUM          HUD scale factor\n"
                 << "  --show-detector-input    Show the exact image sent to the ToF detector\n"
                 << "  --no-preview             Run acquisition/inference without UI\n";
@@ -289,6 +281,8 @@ bool parse_args(int argc, char* argv[], Options& opt)
             opt.stream_auth_enabled = false;
         } else if (arg == "--hud-scale") {
             opt.hud_scale = std::max(1, std::atoi(require_value("--hud-scale")));
+        } else if (arg == "--ground") {
+            opt.enable_ground_plane = true;
         } else if (arg == "--no-ground") {
             opt.enable_ground_plane = false;
         } else if (arg == "--ground-fps") {
@@ -731,6 +725,8 @@ int main(int argc, char* argv[])
             GroundPlaneTracker tracker;
             uint64_t consumed_frame = 0;
             auto last_fit_started = std::chrono::steady_clock::time_point::min();
+            auto last_debug_print = std::chrono::steady_clock::time_point::min();
+            std::string last_debug_status;
             while (running) {
                 SharedFrame lidar_input;
                 {
@@ -761,8 +757,29 @@ int main(int argc, char* argv[])
                 state.fit_ms = std::chrono::duration<double, std::milli>(
                                    std::chrono::steady_clock::now() - now).count();
 
-                std::lock_guard<std::mutex> lock(ground_mutex);
-                latest_ground = state;
+                {
+                    std::lock_guard<std::mutex> lock(ground_mutex);
+                    latest_ground = state;
+                }
+
+                // --- TEMPORARY bring-up instrumentation ---
+                // One [ground] line on status change, otherwise at most 1 Hz (see
+                // PI_HANDOFF.md step 4). Delete this block once the fit is validated.
+                const char* status = state.stale ? "STALE" : (state.plane.valid ? "LOCK" : "NONE");
+                const auto printed_at = std::chrono::steady_clock::now();
+                if (last_debug_status != status || printed_at - last_debug_print >= std::chrono::seconds(1)) {
+                    last_debug_status = status;
+                    last_debug_print = printed_at;
+                    std::ostringstream line;
+                    line << std::fixed << "[ground] " << std::left << std::setw(6) << status << std::right
+                         << "  height " << std::setprecision(0) << state.plane.height_mm << "mm"
+                         << "  tilt " << std::setprecision(1) << state.plane.tilt_deg << "deg"
+                         << "  inliers " << state.plane.inlier_count
+                         << " (" << std::setprecision(0) << state.plane.inlier_ratio * 100.0f << "%)"
+                         << "  fit " << std::setprecision(2) << state.fit_ms << "ms";
+                    std::cerr << line.str() << std::endl;
+                }
+                // --- end TEMPORARY ---
             }
         });
     }
